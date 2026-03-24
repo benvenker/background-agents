@@ -29,8 +29,8 @@ CODE_SERVER_VERSION = "4.109.5"
 AGENT_BROWSER_VERSION = "0.21.2"
 
 # Cache buster - change this to force Modal image rebuild
-# v45: rebuild runtime for OpenRouter/OpenCode refresh
-CACHE_BUSTER = "v45-openrouter-runtime"
+# v44: replace Playwright with agent-browser for browser automation
+CACHE_BUSTER = "v44-agent-browser"
 
 # Base image with all development tools
 base_image = (
@@ -103,7 +103,7 @@ base_image = (
     # CACHE_BUSTER is embedded in a no-op echo so Modal invalidates this layer on bump.
     .run_commands(
         f"echo 'cache: {CACHE_BUSTER}' > /dev/null",
-        f"npm install -g opencode-ai@{OPENCODE_VERSION}",
+        "npm install -g opencode-ai@latest",
         "opencode --version || echo 'OpenCode installed'",
         # Install @opencode-ai/plugin globally for custom tools
         # This ensures tools can import the plugin without needing to run bun add
@@ -129,7 +129,7 @@ base_image = (
         "mkdir -p /workspace",
         "mkdir -p /app/plugins",
         "mkdir -p /tmp/opencode",
-        f"echo 'cache={CACHE_BUSTER} opencode={OPENCODE_VERSION}' > /app/image-version.txt",
+        "echo 'Image rebuilt at: v21-force-rebuild' > /app/image-version.txt",
     )
     # Set environment variables (including cache buster to force rebuild)
     .env(

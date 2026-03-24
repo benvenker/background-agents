@@ -798,13 +798,8 @@ class AgentBridge:
             }
 
             if reasoning_effort:
-                reasoning_provider_id = provider_id
-                reasoning_model_id = model_id
-                if provider_id == "openrouter" and "/" in model_id:
-                    reasoning_provider_id, reasoning_model_id = model_id.split("/", 1)
-
-                if reasoning_provider_id == "anthropic":
-                    if reasoning_model_id in self.ANTHROPIC_ADAPTIVE_THINKING_MODELS:
+                if provider_id == "anthropic":
+                    if model_id in self.ANTHROPIC_ADAPTIVE_THINKING_MODELS:
                         anthropic_options: dict[str, Any] = {
                             "thinking": {"type": "adaptive"},
                         }
@@ -817,7 +812,7 @@ class AgentBridge:
                             model_spec["options"] = {
                                 "thinking": {"type": "enabled", "budgetTokens": budget}
                             }
-                elif reasoning_provider_id == "openai":
+                elif provider_id == "openai":
                     model_spec["options"] = {
                         "reasoningEffort": reasoning_effort,
                         "reasoningSummary": "auto",

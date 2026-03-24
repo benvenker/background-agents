@@ -727,7 +727,6 @@ class TestStartOpenCode:
                 }
             ),
             "OPENROUTER_API_KEY": "test-openrouter-key",
-            "SANDBOX_VERSION": "v45-openrouter-runtime",
         }
         supervisor = _make_supervisor(env)
         supervisor._setup_openai_oauth = MagicMock()
@@ -803,49 +802,3 @@ class TestStartOpenCode:
         config = json.loads(config_path.read_text())
         assert config["model"] == "openrouter/openai/gpt-5.4"
         assert config["provider"]["openrouter"]["options"]["apiKey"] == "test-openrouter-key"
-
-    @pytest.mark.asyncio
-    async def test_logs_resolved_opencode_config(self, base_env, tmp_path):
-        env = {
-            **base_env,
-            "SESSION_CONFIG": json.dumps(
-                {
-                    "provider": "openrouter",
-                    "model": "openai/gpt-5.4",
-                }
-            ),
-            "OPENROUTER_API_KEY": "test-openrouter-key",
-            "SANDBOX_VERSION": "v45-openrouter-runtime",
-            "HOME": str(tmp_path),
-        }
-        supervisor = _make_supervisor(env)
-        supervisor._setup_openai_oauth = MagicMock()
-        supervisor._install_tools = MagicMock()
-        supervisor._wait_for_health = AsyncMock()
-        supervisor.log = MagicMock()
-
-        async def fake_subprocess_exec(*args, **kwargs):
-            process = MagicMock()
-            process.stdout = None
-            return process
-
-        with patch(
-            "sandbox_runtime.entrypoint.asyncio.create_subprocess_exec",
-            side_effect=fake_subprocess_exec,
-        ):
-            with patch.dict(os.environ, env, clear=False):
-                await supervisor.start_opencode()
-
-        supervisor.log.info.assert_any_call(
-            "opencode.config",
-            provider="openrouter",
-            model="openai/gpt-5.4",
-            resolved_model="openrouter/openai/gpt-5.4",
-            sandbox_version="v45-openrouter-runtime",
-            has_openrouter_api_key=True,
-            configured_providers=["openrouter"],
-        )
-        supervisor.log.info.assert_any_call(
-            "opencode.config_written",
-            path=str(tmp_path / ".config" / "opencode" / "opencode.json"),
-        )

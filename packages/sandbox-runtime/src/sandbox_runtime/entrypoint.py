@@ -393,7 +393,7 @@ class SandboxSupervisor:
         # Model format is "provider/model", e.g. "anthropic/claude-sonnet-4-6"
         provider = self.session_config.get("provider", "anthropic")
         model = self.session_config.get("model", "claude-sonnet-4-6")
-        opencode_config: dict = {
+        opencode_config = {
             "model": f"{provider}/{model}",
             "permission": {
                 "*": {
@@ -415,16 +415,6 @@ class SandboxSupervisor:
                 }
             }
 
-        self.log.info(
-            "opencode.config",
-            provider=provider,
-            model=model,
-            resolved_model=opencode_config["model"],
-            sandbox_version=os.environ.get("SANDBOX_VERSION"),
-            has_openrouter_api_key=bool(os.environ.get("OPENROUTER_API_KEY")),
-            configured_providers=sorted(opencode_config.get("provider", {}).keys()),
-        )
-
         # Determine working directory - use repo path if cloned, otherwise /workspace
         workdir = self.workspace_path
         if self.repo_path.exists() and (self.repo_path / ".git").exists():
@@ -434,7 +424,6 @@ class SandboxSupervisor:
         config_dir.mkdir(parents=True, exist_ok=True)
         config_path = config_dir / "opencode.json"
         config_path.write_text(json.dumps(opencode_config), encoding="utf-8")
-        self.log.info("opencode.config_written", path=str(config_path))
 
         self._install_tools(workdir)
 

@@ -41,10 +41,8 @@ function_image = (
 
 # Secrets for LLM API keys - defined in Modal dashboard or CLI
 # These are injected into sandboxes but never stored in snapshots
-llm_secrets = modal.Secret.from_name(
-    "llm-api-keys",
-    required_keys=["ANTHROPIC_API_KEY"],
-)
+# All models route through OpenRouter
+llm_secrets = modal.Secret.from_name("llm-api-keys")
 
 # Secrets for GitHub App - used for git operations (clone, push)
 # These are used to generate installation tokens, NOT injected into sandboxes

@@ -241,41 +241,6 @@ class TestBuildPromptRequestBody:
             "outputConfig": {"effort": "high"},
         }
 
-    def test_with_openrouter_openai_reasoning(self, bridge: AgentBridge):
-        """OpenRouter-routed OpenAI models should keep OpenAI reasoning options."""
-        body = bridge._build_prompt_request_body(
-            "Hello",
-            "openrouter/openai/gpt-5.4",
-            reasoning_effort="high",
-        )
-
-        assert body["model"] == {
-            "providerID": "openrouter",
-            "modelID": "openai/gpt-5.4",
-            "options": {
-                "reasoningEffort": "high",
-                "reasoningSummary": "auto",
-            },
-        }
-
-    def test_with_openrouter_anthropic_reasoning(self, bridge: AgentBridge):
-        """OpenRouter-routed Anthropic models should keep Anthropic thinking options."""
-        body = bridge._build_prompt_request_body(
-            "Hello",
-            "openrouter/anthropic/claude-sonnet-4-6",
-            reasoning_effort="medium",
-        )
-
-        assert body["model"] == {
-            "providerID": "openrouter",
-            "modelID": "anthropic/claude-sonnet-4-6",
-            "options": {
-                "thinking": {"type": "adaptive"},
-                "outputConfig": {"effort": "medium"},
-            },
-        }
-
-
 class TestOpenCodeIdentifier:
     """Tests for OpenCode-compatible ascending ID generation."""
 
