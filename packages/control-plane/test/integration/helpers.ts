@@ -1,5 +1,6 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import type { SessionDO } from "../../src/session/durable-object";
+import { hashToken } from "../../src/auth/crypto";
 
 /**
  * Create a fresh DO, call /internal/init, return the stub and id.
@@ -13,7 +14,7 @@ export async function initSession(overrides?: {
   model?: string;
   reasoningEffort?: string;
   userId?: string;
-  githubLogin?: string;
+  scmLogin?: string;
 }) {
   const id = env.SESSION.newUniqueId();
   const stub = env.SESSION.get(id);
@@ -120,7 +121,7 @@ export async function initNamedSession(
     title?: string;
     model?: string;
     userId?: string;
-    githubLogin?: string;
+    scmLogin?: string;
   }
 ) {
   const id = env.SESSION.idFromName(sessionName);
@@ -199,9 +200,11 @@ export async function openClientWs(
     participantId: string;
   }>();
 
-  // Start collecting BEFORE sending subscribe to avoid race
+  // Start collecting BEFORE sending subscribe to avoid race.
+  // The subscribed message now includes batched replay data, so we terminate on it
+  // (presence_sync follows but is not needed for most tests).
   const collector = collectMessages(ws, {
-    until: (msg) => msg.type === "replay_complete",
+    until: (msg) => msg.type === "subscribed",
   });
 
   ws.send(
@@ -242,10 +245,31 @@ export async function seedSandboxAuth(
   stub: DurableObjectStub,
   opts: { authToken: string; sandboxId: string }
 ): Promise<void> {
+  const tokenHash = await hashToken(opts.authToken);
+
   await runInDurableObject(stub, (instance: SessionDO) => {
     instance.ctx.storage.sql.exec(
-      "UPDATE sandbox SET auth_token = ?, modal_sandbox_id = ?",
+      "UPDATE sandbox SET auth_token = ?, auth_token_hash = ?, modal_sandbox_id = ?",
       opts.authToken,
+      tokenHash,
+      opts.sandboxId
+    );
+  });
+}
+
+/**
+ * Seed auth_token_hash and modal_sandbox_id on the sandbox row.
+ */
+export async function seedSandboxAuthHash(
+  stub: DurableObjectStub,
+  opts: { authToken: string; sandboxId: string }
+): Promise<void> {
+  const tokenHash = await hashToken(opts.authToken);
+
+  await runInDurableObject(stub, (instance: SessionDO) => {
+    instance.ctx.storage.sql.exec(
+      "UPDATE sandbox SET auth_token_hash = ?, auth_token = NULL, modal_sandbox_id = ?",
+      tokenHash,
       opts.sandboxId
     );
   });

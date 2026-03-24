@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 import type { SessionDO } from "../../src/session/durable-object";
+import { MIGRATIONS } from "../../src/session/schema";
 
 describe("SessionDO Durable Object", () => {
   it("returns 404 for uninitialized session state", async () => {
@@ -26,7 +27,7 @@ describe("SessionDO Durable Object", () => {
         title: "Integration test session",
         model: "anthropic/claude-haiku-4-5",
         userId: "user-1",
-        githubLogin: "testuser",
+        scmLogin: "testuser",
       }),
     });
     expect(initResponse.status).toBe(200);
@@ -42,6 +43,7 @@ describe("SessionDO Durable Object", () => {
       status: string;
       model: string;
     }>();
+    expect(state.id).toBe("test-session-init");
     expect(state.title).toBe("Integration test session");
     expect(state.repoOwner).toBe("acme");
     expect(state.repoName).toBe("web-app");
@@ -77,6 +79,33 @@ describe("SessionDO Durable Object", () => {
       expect(tableNames).toContain("events");
       expect(tableNames).toContain("artifacts");
       expect(tableNames).toContain("sandbox");
+      expect(tableNames).toContain("ws_client_mapping");
+      expect(tableNames).toContain("_schema_migrations");
+    });
+  });
+
+  it("records all migration IDs in _schema_migrations", async () => {
+    const id = env.SESSION.newUniqueId();
+    const stub = env.SESSION.get(id);
+
+    await stub.fetch("http://internal/internal/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sessionName: "test-session-migrations",
+        repoOwner: "acme",
+        repoName: "api",
+        userId: "user-3",
+      }),
+    });
+
+    await runInDurableObject(stub, (instance: SessionDO) => {
+      const rows = instance.ctx.storage.sql
+        .exec("SELECT id FROM _schema_migrations ORDER BY id")
+        .toArray() as Array<{ id: number }>;
+
+      const ids = rows.map((r) => r.id);
+      expect(ids).toEqual(MIGRATIONS.map((migration) => migration.id));
     });
   });
 });

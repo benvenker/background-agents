@@ -97,9 +97,14 @@ describe("SessionRepository", () => {
         "owner",
         "repo",
         null,
+        "main",
         "claude-sonnet-4",
         null,
         "created",
+        null,
+        "user",
+        0,
+        0,
         1000,
         2000,
       ]);
@@ -191,16 +196,17 @@ describe("SessionRepository", () => {
       repo.updateSandboxForSpawn({
         status: "spawning",
         createdAt: 1000,
-        authToken: "token-123",
+        authTokenHash: "token-hash-123",
         modalSandboxId: "modal-sb-1",
       });
 
       expect(mock.calls.length).toBe(1);
       expect(mock.calls[0].query).toContain("UPDATE sandbox SET");
       expect(mock.calls[0].query).toContain("status");
-      expect(mock.calls[0].query).toContain("auth_token");
+      expect(mock.calls[0].query).toContain("auth_token_hash");
       expect(mock.calls[0].query).toContain("modal_sandbox_id");
-      expect(mock.calls[0].params).toEqual(["spawning", 1000, "token-123", "modal-sb-1"]);
+      expect(mock.calls[0].query).toContain("auth_token = NULL");
+      expect(mock.calls[0].params).toEqual(["spawning", 1000, "token-hash-123", "modal-sb-1"]);
     });
   });
 
@@ -325,12 +331,12 @@ describe("SessionRepository", () => {
       repo.createParticipant({
         id: "p-1",
         userId: "user-1",
-        githubUserId: "gh-123",
-        githubLogin: "testuser",
-        githubName: "Test User",
-        githubEmail: "test@example.com",
-        githubAccessTokenEncrypted: "encrypted-token",
-        githubTokenExpiresAt: 9000,
+        scmUserId: "gh-123",
+        scmLogin: "testuser",
+        scmName: "Test User",
+        scmEmail: "test@example.com",
+        scmAccessTokenEncrypted: "encrypted-token",
+        scmTokenExpiresAt: 9000,
         role: "owner",
         joinedAt: 1000,
       });
@@ -379,13 +385,13 @@ describe("SessionRepository", () => {
   describe("updateParticipantCoalesce", () => {
     it("only updates non-null fields", () => {
       repo.updateParticipantCoalesce("p-1", {
-        githubLogin: "newlogin",
-        githubName: null,
+        scmLogin: "newlogin",
+        scmName: null,
       });
 
       expect(mock.calls.length).toBe(1);
       expect(mock.calls[0].query).toContain("COALESCE");
-      expect(mock.calls[0].params[0]).toBe(null); // githubUserId
+      expect(mock.calls[0].params[0]).toBe(null); // scmUserId
       expect(mock.calls[0].params[1]).toBe("newlogin");
       expect(mock.calls[0].params[7]).toBe("p-1"); // participantId
     });
@@ -558,6 +564,108 @@ describe("SessionRepository", () => {
         "msg-1",
         1000,
       ]);
+    });
+  });
+
+  describe("upsertTokenEvent", () => {
+    it("upserts token event by deterministic message key", () => {
+      const event = {
+        type: "token" as const,
+        content: "partial response",
+        messageId: "msg-1",
+        sandboxId: "sb-1",
+        timestamp: 1,
+      };
+
+      repo.upsertTokenEvent("msg-1", event, 1000);
+
+      expect(mock.calls.length).toBe(1);
+      expect(mock.calls[0].query).toContain("INSERT INTO events");
+      expect(mock.calls[0].query).toContain("VALUES (?, ?, ?, ?, ?)");
+      expect(mock.calls[0].query).toContain("ON CONFLICT(id) DO UPDATE SET");
+      expect(mock.calls[0].params).toEqual([
+        "token:msg-1",
+        "token",
+        JSON.stringify(event),
+        "msg-1",
+        1000,
+      ]);
+    });
+
+    it("reuses the same deterministic ID across updates", () => {
+      const firstEvent = {
+        type: "token" as const,
+        content: "first",
+        messageId: "msg-1",
+        sandboxId: "sb-1",
+        timestamp: 1,
+      };
+      const secondEvent = {
+        ...firstEvent,
+        content: "second",
+        timestamp: 2,
+      };
+
+      repo.upsertTokenEvent("msg-1", firstEvent, 1000);
+      repo.upsertTokenEvent("msg-1", secondEvent, 2000);
+
+      expect(mock.calls.length).toBe(2);
+      expect(mock.calls[0].params[0]).toBe("token:msg-1");
+      expect(mock.calls[1].params[0]).toBe("token:msg-1");
+      expect(mock.calls[1].params[1]).toBe("token");
+      expect(mock.calls[1].params[2]).toBe(JSON.stringify(secondEvent));
+      expect(mock.calls[1].params[4]).toBe(2000);
+    });
+  });
+
+  describe("upsertExecutionCompleteEvent", () => {
+    it("upserts completion event by deterministic message key", () => {
+      const event = {
+        type: "execution_complete" as const,
+        messageId: "msg-1",
+        success: true,
+        sandboxId: "sb-1",
+        timestamp: 2,
+      };
+
+      repo.upsertExecutionCompleteEvent("msg-1", event, 2000);
+
+      expect(mock.calls.length).toBe(1);
+      expect(mock.calls[0].query).toContain("INSERT INTO events");
+      expect(mock.calls[0].query).toContain("VALUES (?, ?, ?, ?, ?)");
+      expect(mock.calls[0].query).toContain("ON CONFLICT(id) DO UPDATE SET");
+      expect(mock.calls[0].params).toEqual([
+        "execution_complete:msg-1",
+        "execution_complete",
+        JSON.stringify(event),
+        "msg-1",
+        2000,
+      ]);
+    });
+
+    it("reuses the same deterministic completion ID across updates", () => {
+      const firstEvent = {
+        type: "execution_complete" as const,
+        messageId: "msg-1",
+        success: false,
+        sandboxId: "sb-1",
+        timestamp: 2,
+      };
+      const secondEvent = {
+        ...firstEvent,
+        success: true,
+        timestamp: 3,
+      };
+
+      repo.upsertExecutionCompleteEvent("msg-1", firstEvent, 2000);
+      repo.upsertExecutionCompleteEvent("msg-1", secondEvent, 3000);
+
+      expect(mock.calls.length).toBe(2);
+      expect(mock.calls[0].params[0]).toBe("execution_complete:msg-1");
+      expect(mock.calls[1].params[0]).toBe("execution_complete:msg-1");
+      expect(mock.calls[1].params[1]).toBe("execution_complete");
+      expect(mock.calls[1].params[2]).toBe(JSON.stringify(secondEvent));
+      expect(mock.calls[1].params[4]).toBe(3000);
     });
   });
 
@@ -766,16 +874,17 @@ describe("SessionRepository", () => {
 
   describe("getMessageCallbackContext", () => {
     it("returns null for unknown message", () => {
-      mock.setData(`SELECT callback_context FROM messages WHERE id = ?`, []);
+      mock.setData(`SELECT callback_context, source FROM messages WHERE id = ?`, []);
       expect(repo.getMessageCallbackContext("unknown")).toBeNull();
     });
 
     it("returns callback context", () => {
-      mock.setData(`SELECT callback_context FROM messages WHERE id = ?`, [
-        { callback_context: '{"channel":"C123"}' },
+      mock.setData(`SELECT callback_context, source FROM messages WHERE id = ?`, [
+        { callback_context: '{"channel":"C123"}', source: "slack" },
       ]);
       expect(repo.getMessageCallbackContext("msg-1")).toEqual({
         callback_context: '{"channel":"C123"}',
+        source: "slack",
       });
     });
   });

@@ -6,46 +6,89 @@ import type { Env, CreateSessionRequest, CreateSessionResponse } from "./types";
 import { generateId, encryptToken } from "./auth/crypto";
 import { verifyInternalToken } from "./auth/internal";
 import {
-  getGitHubAppConfig,
-  getInstallationRepository,
-  listInstallationRepositories,
-} from "./auth/github-app";
-import {
   resolveScmProviderFromEnv,
   SourceControlProviderError,
   type SourceControlProviderName,
 } from "./source-control";
-import { RepoSecretsStore } from "./db/repo-secrets";
-import { GlobalSecretsStore } from "./db/global-secrets";
-import { SecretsValidationError, normalizeKey, validateKey } from "./db/secrets-validation";
+import { IntegrationSettingsStore } from "./db/integration-settings";
 import { SessionIndexStore } from "./db/session-index";
+import { UserScmTokenStore, DEFAULT_TOKEN_LIFETIME_MS } from "./db/user-scm-tokens";
+import { buildSessionInternalUrl, SessionInternalPaths } from "./session/contracts";
 
-import { RepoMetadataStore } from "./db/repo-metadata";
-import { getValidModelOrDefault, isValidReasoningEffort } from "@open-inspect/shared";
-import { createRequestMetrics, instrumentD1 } from "./db/instrumented-d1";
-import type { RequestMetrics } from "./db/instrumented-d1";
-import type {
-  EnrichedRepository,
-  InstallationRepository,
-  RepoMetadata,
+import {
+  getValidModelOrDefault,
+  isValidReasoningEffort,
+  type CodeServerSettings,
+  type SessionStatus,
+  type CallbackContext,
+  type SpawnChildSessionRequest,
+  type SpawnContext,
 } from "@open-inspect/shared";
+import { createRequestMetrics, instrumentD1 } from "./db/instrumented-d1";
 import { createLogger } from "./logger";
-import type { CorrelationContext } from "./logger";
+import {
+  type Route,
+  type RequestContext,
+  parsePattern,
+  json,
+  error,
+  createRouteSourceControlProvider,
+  resolveInstalledRepo,
+} from "./routes/shared";
+import { integrationSettingsRoutes } from "./routes/integration-settings";
+import { modelPreferencesRoutes } from "./routes/model-preferences";
+import { reposRoutes } from "./routes/repos";
+import { repoImageRoutes } from "./routes/repo-images";
+import { secretsRoutes } from "./routes/secrets";
+import { automationRoutes } from "./routes/automations";
 
 const logger = createLogger("router");
 
-const REPOS_CACHE_KEY = "repos:list";
-const REPOS_CACHE_FRESH_MS = 5 * 60 * 1000; // Serve without revalidation for 5 minutes
-const REPOS_CACHE_KV_TTL_SECONDS = 3600; // Keep stale data in KV for 1 hour
+// Guardrail constants for agent-spawned child sessions
+const MAX_SPAWN_DEPTH = 2;
+const MAX_CONCURRENT_CHILDREN = 5;
+const MAX_TOTAL_CHILDREN = 15;
 
 /**
- * Request context with correlation IDs and per-request metrics.
+ * Resolve whether code-server should be enabled for a given repo,
+ * checking both the `enabled` setting and the `enabledRepos` allowlist.
  */
-export type RequestContext = CorrelationContext & {
-  metrics: RequestMetrics;
-  /** Worker ExecutionContext for waitUntil (background tasks). */
-  executionCtx?: ExecutionContext;
-};
+async function resolveCodeServerEnabled(
+  db: D1Database | undefined,
+  repoOwner: string,
+  repoName: string
+): Promise<boolean> {
+  if (!db) return false;
+  const repo = `${repoOwner}/${repoName}`;
+  try {
+    const store = new IntegrationSettingsStore(db);
+    const { enabledRepos, settings } = await store.getResolvedConfig("code-server", repo);
+    const csSettings = settings as CodeServerSettings;
+    if (csSettings.enabled !== true) return false;
+    // enabledRepos: null → all repos, [] → none, [...] → allowlist
+    if (enabledRepos !== null && !enabledRepos.includes(repo)) return false;
+    return true;
+  } catch (e) {
+    logger.warn("Failed to resolve code-server integration settings, defaulting to disabled", {
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return false;
+  }
+}
+
+const SESSION_STATUSES: SessionStatus[] = [
+  "created",
+  "active",
+  "completed",
+  "failed",
+  "archived",
+  "cancelled",
+];
+
+function parseSessionStatus(value: string | null): SessionStatus | undefined {
+  if (!value) return undefined;
+  return SESSION_STATUSES.includes(value as SessionStatus) ? (value as SessionStatus) : undefined;
+}
 
 /**
  * Create a Request to a Durable Object stub with correlation headers.
@@ -56,45 +99,6 @@ function internalRequest(url: string, init: RequestInit | undefined, ctx: Reques
   headers.set("x-trace-id", ctx.trace_id);
   headers.set("x-request-id", ctx.request_id);
   return new Request(url, { ...init, headers });
-}
-
-/**
- * Route configuration.
- */
-interface Route {
-  method: string;
-  pattern: RegExp;
-  handler: (
-    request: Request,
-    env: Env,
-    match: RegExpMatchArray,
-    ctx: RequestContext
-  ) => Promise<Response>;
-}
-
-/**
- * Parse route pattern into regex.
- */
-function parsePattern(pattern: string): RegExp {
-  const regexPattern = pattern.replace(/:(\w+)/g, "(?<$1>[^/]+)");
-  return new RegExp(`^${regexPattern}$`);
-}
-
-/**
- * Create JSON response.
- */
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-/**
- * Create error response.
- */
-function error(message: string, status = 400): Response {
-  return json({ error: message }, status);
 }
 
 function withCorsAndTraceHeaders(response: Response, ctx: RequestContext): Response {
@@ -134,6 +138,9 @@ const PUBLIC_ROUTES: RegExp[] = [/^\/health$/];
 const SANDBOX_AUTH_ROUTES: RegExp[] = [
   /^\/sessions\/[^/]+\/pr$/, // PR creation from sandbox
   /^\/sessions\/[^/]+\/openai-token-refresh$/, // OpenAI token refresh from sandbox
+  /^\/sessions\/[^/]+\/children$/, // POST spawn, GET list
+  /^\/sessions\/[^/]+\/children\/[^/]+$/, // GET child detail
+  /^\/sessions\/[^/]+\/children\/[^/]+\/cancel$/, // POST cancel child
 ];
 
 type CachedScmProvider =
@@ -260,7 +267,7 @@ async function verifySandboxAuth(
 
   const verifyResponse = await stub.fetch(
     internalRequest(
-      "http://internal/internal/verify-sandbox-token",
+      buildSessionInternalUrl(SessionInternalPaths.verifySandboxToken),
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -414,6 +421,11 @@ const routes: Route[] = [
     handler: handleSessionWsToken,
   },
   {
+    method: "PATCH",
+    pattern: parsePattern("/sessions/:id/title"),
+    handler: handleUpdateSessionTitle,
+  },
+  {
     method: "POST",
     pattern: parsePattern("/sessions/:id/archive"),
     handler: handleArchiveSession,
@@ -424,54 +436,45 @@ const routes: Route[] = [
     handler: handleUnarchiveSession,
   },
 
-  // Repository management
+  // Child session management (sandbox-authenticated)
   {
-    method: "GET",
-    pattern: parsePattern("/repos"),
-    handler: handleListRepos,
-  },
-  {
-    method: "PUT",
-    pattern: parsePattern("/repos/:owner/:name/metadata"),
-    handler: handleUpdateRepoMetadata,
+    method: "POST",
+    pattern: parsePattern("/sessions/:id/children"),
+    handler: handleSpawnChild,
   },
   {
     method: "GET",
-    pattern: parsePattern("/repos/:owner/:name/metadata"),
-    handler: handleGetRepoMetadata,
-  },
-  {
-    method: "PUT",
-    pattern: parsePattern("/repos/:owner/:name/secrets"),
-    handler: handleSetRepoSecrets,
+    pattern: parsePattern("/sessions/:id/children"),
+    handler: handleListChildren,
   },
   {
     method: "GET",
-    pattern: parsePattern("/repos/:owner/:name/secrets"),
-    handler: handleListRepoSecrets,
+    pattern: parsePattern("/sessions/:id/children/:childId"),
+    handler: handleGetChild,
   },
   {
-    method: "DELETE",
-    pattern: parsePattern("/repos/:owner/:name/secrets/:key"),
-    handler: handleDeleteRepoSecret,
+    method: "POST",
+    pattern: parsePattern("/sessions/:id/children/:childId/cancel"),
+    handler: handleCancelChild,
   },
 
-  // Global secrets
-  {
-    method: "PUT",
-    pattern: parsePattern("/secrets"),
-    handler: handleSetGlobalSecrets,
-  },
-  {
-    method: "GET",
-    pattern: parsePattern("/secrets"),
-    handler: handleListGlobalSecrets,
-  },
-  {
-    method: "DELETE",
-    pattern: parsePattern("/secrets/:key"),
-    handler: handleDeleteGlobalSecret,
-  },
+  // Repository management
+  ...reposRoutes,
+
+  // Secrets
+  ...secretsRoutes,
+
+  // Model preferences
+  ...modelPreferencesRoutes,
+
+  // Integration settings
+  ...integrationSettingsRoutes,
+
+  // Repo image builds
+  ...repoImageRoutes,
+
+  // Automations
+  ...automationRoutes,
 ];
 
 /**
@@ -604,8 +607,18 @@ async function handleListSessions(
   const url = new URL(request.url);
   const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 100);
   const offset = parseInt(url.searchParams.get("offset") || "0");
-  const status = url.searchParams.get("status") || undefined;
-  const excludeStatus = url.searchParams.get("excludeStatus") || undefined;
+  const statusParam = url.searchParams.get("status");
+  const excludeStatusParam = url.searchParams.get("excludeStatus");
+  const status = parseSessionStatus(statusParam);
+  const excludeStatus = parseSessionStatus(excludeStatusParam);
+
+  if (statusParam && !status) {
+    return error("Invalid status", 400);
+  }
+
+  if (excludeStatusParam && !excludeStatus) {
+    return error("Invalid excludeStatus", 400);
+  }
 
   const store = new SessionIndexStore(env.DB);
   const result = await store.list({ status, excludeStatus, limit, offset });
@@ -624,17 +637,23 @@ async function handleCreateSession(
   ctx: RequestContext
 ): Promise<Response> {
   const body = (await request.json()) as CreateSessionRequest & {
-    // Optional GitHub token for PR creation (will be encrypted and stored)
-    githubToken?: string;
-    // User info
+    scmToken?: string;
+    scmRefreshToken?: string;
+    scmTokenExpiresAt?: number;
+    scmUserId?: string;
     userId?: string;
-    githubLogin?: string;
-    githubName?: string;
-    githubEmail?: string;
+    scmLogin?: string;
+    scmName?: string;
+    scmEmail?: string;
   };
 
   if (!body.repoOwner || !body.repoName) {
     return error("repoOwner and repoName are required");
+  }
+
+  // Validate branch name if provided (defense in depth)
+  if (body.branch && !/^[\w.\-/]+$/.test(body.branch)) {
+    return error("Invalid branch name");
   }
 
   // Normalize repo identifiers to lowercase for consistent storage
@@ -642,12 +661,15 @@ async function handleCreateSession(
   const repoName = body.repoName.toLowerCase();
 
   let repoId: number;
+  let defaultBranch: string;
   try {
-    const resolved = await resolveInstalledRepo(env, repoOwner, repoName);
+    const provider = createRouteSourceControlProvider(env);
+    const resolved = await resolveInstalledRepo(provider, repoOwner, repoName);
     if (!resolved) {
       return error("Repository is not installed for the GitHub App", 404);
     }
     repoId = resolved.repoId;
+    defaultBranch = resolved.defaultBranch;
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     logger.error("Failed to resolve repository", {
@@ -655,28 +677,41 @@ async function handleCreateSession(
       repo_owner: repoOwner,
       repo_name: repoName,
     });
-    return error(
-      message === "GitHub App not configured" ? message : "Failed to resolve repository",
-      500
-    );
+    const isConfigError =
+      e instanceof SourceControlProviderError && e.errorType === "permanent" && !e.httpStatus;
+    return error(isConfigError ? message : "Failed to resolve repository", 500);
   }
 
-  // User info from direct params
   const userId = body.userId || "anonymous";
-  const githubLogin = body.githubLogin;
-  const githubName = body.githubName;
-  const githubEmail = body.githubEmail;
-  let githubTokenEncrypted: string | null = null;
+  const scmLogin = body.scmLogin;
+  const scmName = body.scmName;
+  const scmEmail = body.scmEmail;
+  const scmToken = body.scmToken;
+  const scmRefreshToken = body.scmRefreshToken;
+  const scmTokenExpiresAt = body.scmTokenExpiresAt;
+  const scmUserId = body.scmUserId;
+  let scmTokenEncrypted: string | null = null;
+  let scmRefreshTokenEncrypted: string | null = null;
 
-  // If GitHub token provided, encrypt it
-  if (body.githubToken && env.TOKEN_ENCRYPTION_KEY) {
+  // If SCM token provided, encrypt it
+  if (scmToken && env.TOKEN_ENCRYPTION_KEY) {
     try {
-      githubTokenEncrypted = await encryptToken(body.githubToken, env.TOKEN_ENCRYPTION_KEY);
+      scmTokenEncrypted = await encryptToken(scmToken, env.TOKEN_ENCRYPTION_KEY);
     } catch (e) {
-      logger.error("Failed to encrypt GitHub token", {
+      logger.error("Failed to encrypt SCM token", {
         error: e instanceof Error ? e : String(e),
       });
-      return error("Failed to process GitHub token", 500);
+      return error("Failed to process SCM token", 500);
+    }
+  }
+
+  if (scmRefreshToken && env.TOKEN_ENCRYPTION_KEY) {
+    try {
+      scmRefreshTokenEncrypted = await encryptToken(scmRefreshToken, env.TOKEN_ENCRYPTION_KEY);
+    } catch (e) {
+      logger.warn("Session created without refresh token — token refresh will be unavailable", {
+        error: e instanceof Error ? e : String(e),
+      });
     }
   }
 
@@ -694,10 +729,13 @@ async function handleCreateSession(
       ? body.reasoningEffort
       : null;
 
+  // Resolve code-server integration setting for this repo
+  const codeServerEnabled = await resolveCodeServerEnabled(env.DB, repoOwner, repoName);
+
   // Initialize session with user info and optional encrypted token
   const initResponse = await stub.fetch(
     internalRequest(
-      "http://internal/internal/init",
+      buildSessionInternalUrl(SessionInternalPaths.init),
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -706,14 +744,20 @@ async function handleCreateSession(
           repoOwner,
           repoName,
           repoId,
+          defaultBranch,
+          branch: body.branch,
           title: body.title,
           model,
           reasoningEffort,
           userId,
-          githubLogin,
-          githubName,
-          githubEmail,
-          githubTokenEncrypted, // Pass encrypted token to store with owner
+          scmLogin,
+          scmName,
+          scmEmail,
+          scmTokenEncrypted,
+          scmRefreshTokenEncrypted,
+          scmTokenExpiresAt,
+          scmUserId,
+          codeServerEnabled,
         }),
       },
       ctx
@@ -722,6 +766,24 @@ async function handleCreateSession(
 
   if (!initResponse.ok) {
     return error("Failed to create session", 500);
+  }
+
+  // Populate D1 with the user's SCM tokens (non-blocking) so centralized refresh works
+  if (scmUserId && scmToken && scmRefreshToken && env.TOKEN_ENCRYPTION_KEY) {
+    ctx.executionCtx?.waitUntil(
+      new UserScmTokenStore(env.DB, env.TOKEN_ENCRYPTION_KEY)
+        .upsertTokens(
+          scmUserId,
+          scmToken,
+          scmRefreshToken,
+          scmTokenExpiresAt ?? Date.now() + DEFAULT_TOKEN_LIFETIME_MS
+        )
+        .catch((e) =>
+          logger.error("Failed to write tokens to D1", {
+            error: e instanceof Error ? e : String(e),
+          })
+        )
+    );
   }
 
   // Store session in D1 index for listing
@@ -734,6 +796,7 @@ async function handleCreateSession(
     repoName,
     model,
     reasoningEffort,
+    baseBranch: body.branch || defaultBranch || "main",
     status: "created",
     createdAt: now,
     updatedAt: now,
@@ -760,7 +823,7 @@ async function handleGetSession(
   const stub = env.SESSION.get(doId);
 
   const response = await stub.fetch(
-    internalRequest("http://internal/internal/state", undefined, ctx)
+    internalRequest(buildSessionInternalUrl(SessionInternalPaths.state), undefined, ctx)
   );
 
   if (!response.ok) {
@@ -805,13 +868,7 @@ async function handleSessionPrompt(
     model?: string;
     reasoningEffort?: string;
     attachments?: Array<{ type: string; name: string; url?: string }>;
-    callbackContext?: {
-      channel: string;
-      threadTs: string;
-      repoFullName: string;
-      model: string;
-      reactionMessageTs?: string;
-    };
+    callbackContext?: CallbackContext;
   };
 
   if (!body.content) {
@@ -823,7 +880,7 @@ async function handleSessionPrompt(
 
   const response = await stub.fetch(
     internalRequest(
-      "http://internal/internal/prompt",
+      buildSessionInternalUrl(SessionInternalPaths.prompt),
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -841,6 +898,19 @@ async function handleSessionPrompt(
     )
   );
 
+  // Background: update D1 timestamp so session bubbles to top of sidebar
+  const store = new SessionIndexStore(env.DB);
+  ctx.executionCtx?.waitUntil(
+    store.touchUpdatedAt(sessionId).catch((error) => {
+      logger.error("session_index.touch_updated_at.background_error", {
+        session_id: sessionId,
+        trace_id: ctx.trace_id,
+        request_id: ctx.request_id,
+        error,
+      });
+    })
+  );
+
   return response;
 }
 
@@ -853,7 +923,9 @@ async function handleSessionStop(
   const stub = getSessionStub(env, match);
   if (!stub) return error("Session ID required");
 
-  return stub.fetch(internalRequest("http://internal/internal/stop", { method: "POST" }, ctx));
+  return stub.fetch(
+    internalRequest(buildSessionInternalUrl(SessionInternalPaths.stop), { method: "POST" }, ctx)
+  );
 }
 
 async function handleSessionEvents(
@@ -867,7 +939,11 @@ async function handleSessionEvents(
 
   const url = new URL(request.url);
   return stub.fetch(
-    internalRequest(`http://internal/internal/events${url.search}`, undefined, ctx)
+    internalRequest(
+      buildSessionInternalUrl(SessionInternalPaths.events, url.search),
+      undefined,
+      ctx
+    )
   );
 }
 
@@ -880,7 +956,9 @@ async function handleSessionArtifacts(
   const stub = getSessionStub(env, match);
   if (!stub) return error("Session ID required");
 
-  return stub.fetch(internalRequest("http://internal/internal/artifacts", undefined, ctx));
+  return stub.fetch(
+    internalRequest(buildSessionInternalUrl(SessionInternalPaths.artifacts), undefined, ctx)
+  );
 }
 
 async function handleSessionParticipants(
@@ -892,7 +970,9 @@ async function handleSessionParticipants(
   const stub = getSessionStub(env, match);
   if (!stub) return error("Session ID required");
 
-  return stub.fetch(internalRequest("http://internal/internal/participants", undefined, ctx));
+  return stub.fetch(
+    internalRequest(buildSessionInternalUrl(SessionInternalPaths.participants), undefined, ctx)
+  );
 }
 
 async function handleAddParticipant(
@@ -911,7 +991,7 @@ async function handleAddParticipant(
 
   const response = await stub.fetch(
     internalRequest(
-      "http://internal/internal/participants",
+      buildSessionInternalUrl(SessionInternalPaths.participants),
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -935,7 +1015,11 @@ async function handleSessionMessages(
 
   const url = new URL(request.url);
   return stub.fetch(
-    internalRequest(`http://internal/internal/messages${url.search}`, undefined, ctx)
+    internalRequest(
+      buildSessionInternalUrl(SessionInternalPaths.messages, url.search),
+      undefined,
+      ctx
+    )
   );
 }
 
@@ -977,7 +1061,7 @@ async function handleCreatePR(
 
   const response = await stub.fetch(
     internalRequest(
-      "http://internal/internal/create-pr",
+      buildSessionInternalUrl(SessionInternalPaths.createPr),
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1005,7 +1089,11 @@ async function handleOpenAITokenRefresh(
   if (!stub) return error("Session ID required");
 
   return stub.fetch(
-    internalRequest("http://internal/internal/openai-token-refresh", { method: "POST" }, ctx)
+    internalRequest(
+      buildSessionInternalUrl(SessionInternalPaths.openaiTokenRefresh),
+      { method: "POST" },
+      ctx
+    )
   );
 }
 
@@ -1020,50 +1108,75 @@ async function handleSessionWsToken(
 
   const body = (await request.json()) as {
     userId: string;
-    githubUserId?: string;
-    githubLogin?: string;
-    githubName?: string;
-    githubEmail?: string;
-    githubToken?: string; // User's GitHub OAuth token for PR creation
-    githubTokenExpiresAt?: number; // Token expiry timestamp in milliseconds
-    githubRefreshToken?: string; // GitHub OAuth refresh token for server-side renewal
+    scmUserId?: string;
+    scmLogin?: string;
+    scmName?: string;
+    scmEmail?: string;
+    scmToken?: string;
+    scmTokenExpiresAt?: number;
+    scmRefreshToken?: string;
   };
 
   if (!body.userId) {
     return error("userId is required");
   }
 
-  // Encrypt the GitHub tokens if provided
-  const { githubTokenEncrypted, githubRefreshTokenEncrypted } = await ctx.metrics.time(
+  const scmUserId = body.scmUserId;
+  const scmLogin = body.scmLogin;
+  const scmName = body.scmName;
+  const scmEmail = body.scmEmail;
+  const scmToken = body.scmToken;
+  const scmTokenExpiresAt = body.scmTokenExpiresAt;
+  const scmRefreshToken = body.scmRefreshToken;
+
+  // Encrypt the SCM tokens if provided
+  const { scmTokenEncrypted, scmRefreshTokenEncrypted } = await ctx.metrics.time(
     "encrypt_tokens",
     async () => {
       let accessToken: string | null = null;
       let refreshToken: string | null = null;
 
-      if (body.githubToken && env.TOKEN_ENCRYPTION_KEY) {
+      if (scmToken && env.TOKEN_ENCRYPTION_KEY) {
         try {
-          accessToken = await encryptToken(body.githubToken, env.TOKEN_ENCRYPTION_KEY);
+          accessToken = await encryptToken(scmToken, env.TOKEN_ENCRYPTION_KEY);
         } catch (e) {
-          logger.error("Failed to encrypt GitHub token", {
-            error: e instanceof Error ? e : String(e),
-          });
-          // Continue without token - PR creation will fail if this user triggers it
-        }
-      }
-
-      if (body.githubRefreshToken && env.TOKEN_ENCRYPTION_KEY) {
-        try {
-          refreshToken = await encryptToken(body.githubRefreshToken, env.TOKEN_ENCRYPTION_KEY);
-        } catch (e) {
-          logger.error("Failed to encrypt GitHub refresh token", {
+          logger.error("Failed to encrypt SCM token", {
             error: e instanceof Error ? e : String(e),
           });
         }
       }
 
-      return { githubTokenEncrypted: accessToken, githubRefreshTokenEncrypted: refreshToken };
+      if (scmRefreshToken && env.TOKEN_ENCRYPTION_KEY) {
+        try {
+          refreshToken = await encryptToken(scmRefreshToken, env.TOKEN_ENCRYPTION_KEY);
+        } catch (e) {
+          logger.error("Failed to encrypt SCM refresh token", {
+            error: e instanceof Error ? e : String(e),
+          });
+        }
+      }
+
+      return { scmTokenEncrypted: accessToken, scmRefreshTokenEncrypted: refreshToken };
     }
   );
+
+  // Populate D1 with the user's SCM tokens (non-blocking) so centralized refresh works
+  if (scmUserId && scmToken && scmRefreshToken && env.TOKEN_ENCRYPTION_KEY) {
+    ctx.executionCtx?.waitUntil(
+      new UserScmTokenStore(env.DB, env.TOKEN_ENCRYPTION_KEY)
+        .upsertTokens(
+          scmUserId,
+          scmToken,
+          scmRefreshToken,
+          scmTokenExpiresAt ?? Date.now() + DEFAULT_TOKEN_LIFETIME_MS
+        )
+        .catch((e) =>
+          logger.error("Failed to write tokens to D1", {
+            error: e instanceof Error ? e : String(e),
+          })
+        )
+    );
+  }
 
   const doId = env.SESSION.idFromName(sessionId);
   const stub = env.SESSION.get(doId);
@@ -1071,25 +1184,75 @@ async function handleSessionWsToken(
   const response = await ctx.metrics.time("do_fetch", () =>
     stub.fetch(
       internalRequest(
-        "http://internal/internal/ws-token",
+        buildSessionInternalUrl(SessionInternalPaths.wsToken),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             userId: body.userId,
-            githubUserId: body.githubUserId,
-            githubLogin: body.githubLogin,
-            githubName: body.githubName,
-            githubEmail: body.githubEmail,
-            githubTokenEncrypted,
-            githubRefreshTokenEncrypted,
-            githubTokenExpiresAt: body.githubTokenExpiresAt,
+            scmUserId,
+            scmLogin,
+            scmName,
+            scmEmail,
+            scmTokenEncrypted,
+            scmRefreshTokenEncrypted,
+            scmTokenExpiresAt,
           }),
         },
         ctx
       )
     )
   );
+
+  return response;
+}
+
+async function handleUpdateSessionTitle(
+  request: Request,
+  env: Env,
+  match: RegExpMatchArray,
+  ctx: RequestContext
+): Promise<Response> {
+  const sessionId = match.groups?.id;
+  if (!sessionId) return error("Session ID required");
+
+  let userId: string | undefined;
+  let title: string | undefined;
+
+  try {
+    const body = (await request.json()) as { userId?: string; title?: string };
+    userId = body.userId;
+    title = body.title;
+  } catch (_error) {
+    // Body parsing failed, continue without userId/title
+    userId = undefined;
+    title = undefined;
+  }
+
+  const doId = env.SESSION.idFromName(sessionId);
+  const stub = env.SESSION.get(doId);
+
+  const response = await stub.fetch(
+    internalRequest(
+      buildSessionInternalUrl(SessionInternalPaths.updateTitle),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId, title }),
+      },
+      ctx
+    )
+  );
+
+  if (response.ok) {
+    // read the validated title from the DO response
+    const doResult = (await response.clone().json()) as { title: string };
+    const sessionStore = new SessionIndexStore(env.DB);
+    const updated = await sessionStore.updateTitle(sessionId, doResult.title);
+    if (!updated) {
+      logger.warn("Session not found in D1 index during title update", { session_id: sessionId });
+    }
+  }
 
   return response;
 }
@@ -1117,7 +1280,7 @@ async function handleArchiveSession(
 
   const response = await stub.fetch(
     internalRequest(
-      "http://internal/internal/archive",
+      buildSessionInternalUrl(SessionInternalPaths.archive),
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1162,7 +1325,7 @@ async function handleUnarchiveSession(
 
   const response = await stub.fetch(
     internalRequest(
-      "http://internal/internal/unarchive",
+      buildSessionInternalUrl(SessionInternalPaths.unarchive),
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1184,721 +1347,289 @@ async function handleUnarchiveSession(
   return response;
 }
 
-// Repository handlers
+// Child session handlers
 
-async function resolveInstalledRepo(
-  env: Env,
-  repoOwner: string,
-  repoName: string
-): Promise<{ repoId: number; repoOwner: string; repoName: string } | null> {
-  const appConfig = getGitHubAppConfig(env);
-  if (!appConfig) {
-    throw new Error("GitHub App not configured");
-  }
-
-  const repo = await getInstallationRepository(appConfig, repoOwner, repoName);
-  if (!repo) {
-    return null;
-  }
-
-  return {
-    repoId: repo.id,
-    repoOwner: repoOwner.toLowerCase(),
-    repoName: repoName.toLowerCase(),
-  };
-}
-
-/**
- * Cached repos list structure stored in KV.
- */
-interface CachedReposList {
-  repos: EnrichedRepository[];
-  cachedAt: string;
-  /** Epoch ms — cache is considered fresh until this time. Missing in entries cached before this field was added. */
-  freshUntil?: number;
-}
-
-/**
- * Fetch repos from GitHub, enrich with D1 metadata, and write to KV cache.
- * Runs either in the foreground (cache miss) or background (stale-while-revalidate).
- */
-async function refreshReposCache(env: Env, traceId?: string): Promise<void> {
-  const appConfig = getGitHubAppConfig(env);
-  if (!appConfig) return;
-
-  let repos: InstallationRepository[];
-  try {
-    const result = await listInstallationRepositories(appConfig);
-    repos = result.repos;
-
-    logger.info("GitHub repo fetch completed", {
-      trace_id: traceId,
-      total_repos: result.timing.totalRepos,
-      total_pages: result.timing.totalPages,
-      token_generation_ms: result.timing.tokenGenerationMs,
-      pages: result.timing.pages,
-    });
-  } catch (e) {
-    logger.error("Failed to list installation repositories (background refresh)", {
-      trace_id: traceId,
-      error: e instanceof Error ? e : String(e),
-    });
-    return;
-  }
-
-  const metadataStore = new RepoMetadataStore(env.DB);
-  let metadataMap: Map<string, RepoMetadata>;
-  try {
-    metadataMap = await metadataStore.getBatch(
-      repos.map((r) => ({ owner: r.owner, name: r.name }))
-    );
-  } catch (e) {
-    logger.warn("Failed to fetch repo metadata batch (background refresh)", {
-      trace_id: traceId,
-      error: e instanceof Error ? e : String(e),
-    });
-    metadataMap = new Map();
-  }
-
-  const enrichedRepos: EnrichedRepository[] = repos.map((repo) => {
-    const key = `${repo.owner.toLowerCase()}/${repo.name.toLowerCase()}`;
-    const metadata = metadataMap.get(key);
-    return metadata ? { ...repo, metadata } : repo;
-  });
-
-  const cachedAt = new Date().toISOString();
-  const freshUntil = Date.now() + REPOS_CACHE_FRESH_MS;
-  try {
-    await env.REPOS_CACHE.put(
-      REPOS_CACHE_KEY,
-      JSON.stringify({ repos: enrichedRepos, cachedAt, freshUntil }),
-      { expirationTtl: REPOS_CACHE_KV_TTL_SECONDS }
-    );
-    logger.info("Repos cache refreshed", {
-      trace_id: traceId,
-      repo_count: enrichedRepos.length,
-    });
-  } catch (e) {
-    logger.warn("Failed to write repos cache", {
-      trace_id: traceId,
-      error: e instanceof Error ? e : String(e),
-    });
-  }
-}
-
-/**
- * List all repositories accessible via the GitHub App installation.
- *
- * Uses stale-while-revalidate caching:
- * - Fresh cache (< 5 min old): return immediately
- * - Stale cache (5 min – 1 hr): return immediately, revalidate in background
- * - No cache: fetch synchronously (first load or after 1 hr KV expiry)
- *
- * This prevents the slow GitHub API pagination from blocking the Worker
- * isolate and causing head-of-line blocking for other requests.
- */
-async function handleListRepos(
+async function handleSpawnChild(
   request: Request,
   env: Env,
-  _match: RegExpMatchArray,
+  match: RegExpMatchArray,
   ctx: RequestContext
 ): Promise<Response> {
-  // Read from KV cache
-  let cached: CachedReposList | null = null;
-  try {
-    cached = await ctx.metrics.time("kv_read", () =>
-      env.REPOS_CACHE.get<CachedReposList>(REPOS_CACHE_KEY, "json")
-    );
-  } catch (e) {
-    logger.warn("Failed to read repos cache", { error: e instanceof Error ? e : String(e) });
+  const parentId = match.groups?.id;
+  if (!parentId) return error("Parent session ID required");
+
+  const body = (await request.json()) as SpawnChildSessionRequest;
+
+  if (!body.title || !body.prompt) {
+    return error("title and prompt are required");
   }
 
-  if (cached) {
-    const isFresh = cached.freshUntil && Date.now() < cached.freshUntil;
+  const sessionStore = new SessionIndexStore(env.DB);
 
-    if (!isFresh && ctx.executionCtx) {
-      // Stale — serve immediately but refresh in background
-      logger.info("Serving stale repos cache, refreshing in background", {
-        trace_id: ctx.trace_id,
-        cached_at: cached.cachedAt,
-      });
-      ctx.executionCtx.waitUntil(refreshReposCache(env, ctx.trace_id));
-    }
-
-    return json({
-      repos: cached.repos,
-      cached: true,
-      cachedAt: cached.cachedAt,
-    });
+  // Guardrail: depth
+  const parentDepth = await sessionStore.getSpawnDepth(parentId);
+  if (parentDepth >= MAX_SPAWN_DEPTH) {
+    return error(`Maximum spawn depth (${MAX_SPAWN_DEPTH}) exceeded`, 403);
   }
 
-  // No cache at all — must fetch synchronously
-  const appConfig = getGitHubAppConfig(env);
-  if (!appConfig) {
-    return error("GitHub App not configured", 500);
+  // Guardrail: concurrent children
+  const activeCount = await sessionStore.countActiveChildren(parentId);
+  if (activeCount >= MAX_CONCURRENT_CHILDREN) {
+    return error(`Maximum concurrent children (${MAX_CONCURRENT_CHILDREN}) reached`, 429);
   }
 
-  let repos: InstallationRepository[];
-  try {
-    const result = await ctx.metrics.time("github_api", () =>
-      listInstallationRepositories(appConfig)
-    );
-    repos = result.repos;
-
-    logger.info("GitHub repo fetch completed", {
-      trace_id: ctx.trace_id,
-      total_repos: result.timing.totalRepos,
-      total_pages: result.timing.totalPages,
-      token_generation_ms: result.timing.tokenGenerationMs,
-      pages: result.timing.pages,
-    });
-  } catch (e) {
-    logger.error("Failed to list installation repositories", {
-      error: e instanceof Error ? e : String(e),
-    });
-    return error("Failed to fetch repositories from GitHub", 500);
+  // Guardrail: total children
+  const totalCount = await sessionStore.countTotalChildren(parentId);
+  if (totalCount >= MAX_TOTAL_CHILDREN) {
+    return error(`Maximum total children (${MAX_TOTAL_CHILDREN}) reached`, 429);
   }
 
-  const metadataStore = new RepoMetadataStore(env.DB);
-  let metadataMap: Map<string, RepoMetadata>;
-  try {
-    metadataMap = await metadataStore.getBatch(
-      repos.map((r) => ({ owner: r.owner, name: r.name }))
-    );
-  } catch (e) {
-    logger.warn("Failed to fetch repo metadata batch", {
-      error: e instanceof Error ? e : String(e),
-    });
-    metadataMap = new Map();
+  // Get parent context from parent DO
+  const parentDoId = env.SESSION.idFromName(parentId);
+  const parentStub = env.SESSION.get(parentDoId);
+
+  const spawnContextRes = await parentStub.fetch(
+    internalRequest(buildSessionInternalUrl(SessionInternalPaths.spawnContext), undefined, ctx)
+  );
+
+  if (!spawnContextRes.ok) {
+    return error("Failed to get parent session context", 500);
   }
 
-  const enrichedRepos: EnrichedRepository[] = repos.map((repo) => {
-    const key = `${repo.owner.toLowerCase()}/${repo.name.toLowerCase()}`;
-    const metadata = metadataMap.get(key);
-    return metadata ? { ...repo, metadata } : repo;
+  const spawnContext = (await spawnContextRes.json()) as SpawnContext;
+
+  // Guardrail: same-repo — reject if either field doesn't match parent
+  if (
+    (body.repoOwner && body.repoOwner.toLowerCase() !== spawnContext.repoOwner.toLowerCase()) ||
+    (body.repoName && body.repoName.toLowerCase() !== spawnContext.repoName.toLowerCase())
+  ) {
+    return error("Child sessions must use the same repository as the parent", 403);
+  }
+
+  // Create child session (same pattern as handleCreateSession)
+  const childId = generateId();
+  const childDoId = env.SESSION.idFromName(childId);
+  const childStub = env.SESSION.get(childDoId);
+
+  const model = getValidModelOrDefault(body.model || spawnContext.model);
+  const reasoningEffort =
+    body.reasoningEffort && isValidReasoningEffort(model, body.reasoningEffort)
+      ? body.reasoningEffort
+      : spawnContext.reasoningEffort;
+
+  const childDepth = parentDepth + 1;
+
+  logger.info("Spawning child session", {
+    event: "session.spawn_child",
+    parent_id: parentId,
+    child_id: childId,
+    child_depth: childDepth,
+    model,
   });
 
-  const cachedAt = new Date().toISOString();
-  const freshUntil = Date.now() + REPOS_CACHE_FRESH_MS;
+  // Resolve code-server integration setting for child (same repo as parent)
+  const childCodeServerEnabled = await resolveCodeServerEnabled(
+    env.DB,
+    spawnContext.repoOwner,
+    spawnContext.repoName
+  );
+
+  // Initialize child DO
+  const initResponse = await childStub.fetch(
+    internalRequest(
+      buildSessionInternalUrl(SessionInternalPaths.init),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionName: childId,
+          repoOwner: spawnContext.repoOwner,
+          repoName: spawnContext.repoName,
+          repoId: spawnContext.repoId,
+          title: body.title,
+          model,
+          reasoningEffort,
+          userId: spawnContext.owner.userId,
+          scmLogin: spawnContext.owner.scmLogin,
+          scmName: spawnContext.owner.scmName,
+          scmEmail: spawnContext.owner.scmEmail,
+          scmTokenEncrypted: spawnContext.owner.scmAccessTokenEncrypted,
+          scmRefreshTokenEncrypted: spawnContext.owner.scmRefreshTokenEncrypted,
+          scmTokenExpiresAt: spawnContext.owner.scmTokenExpiresAt,
+          scmUserId: spawnContext.owner.scmUserId,
+          branch: spawnContext.baseBranch ?? "main",
+          parentSessionId: parentId,
+          spawnSource: "agent",
+          spawnDepth: childDepth,
+          codeServerEnabled: childCodeServerEnabled,
+        }),
+      },
+      ctx
+    )
+  );
+
+  if (!initResponse.ok) {
+    return error("Failed to create child session", 500);
+  }
+
+  // Store in D1 index
+  const now = Date.now();
+  await sessionStore.create({
+    id: childId,
+    title: body.title,
+    repoOwner: spawnContext.repoOwner,
+    repoName: spawnContext.repoName,
+    model,
+    reasoningEffort,
+    baseBranch: spawnContext.baseBranch ?? "main",
+    status: "created",
+    parentSessionId: parentId,
+    spawnSource: "agent",
+    spawnDepth: childDepth,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  // Enqueue the prompt on the child DO
+  let promptResponse: Response;
   try {
-    await ctx.metrics.time("kv_write", () =>
-      env.REPOS_CACHE.put(
-        REPOS_CACHE_KEY,
-        JSON.stringify({ repos: enrichedRepos, cachedAt, freshUntil }),
-        { expirationTtl: REPOS_CACHE_KV_TTL_SECONDS }
+    promptResponse = await childStub.fetch(
+      internalRequest(
+        buildSessionInternalUrl(SessionInternalPaths.prompt),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            content: body.prompt,
+            authorId: spawnContext.owner.userId,
+            source: "agent",
+          }),
+        },
+        ctx
       )
     );
-  } catch (e) {
-    logger.warn("Failed to cache repos list", { error: e instanceof Error ? e : String(e) });
+  } catch (enqueueError) {
+    logger.error("Failed to enqueue initial prompt for child session", {
+      event: "session.spawn_child_prompt_enqueue_failed",
+      parent_id: parentId,
+      child_id: childId,
+      trace_id: ctx.trace_id,
+      request_id: ctx.request_id,
+      error: enqueueError instanceof Error ? enqueueError.message : String(enqueueError),
+    });
+    await sessionStore.updateStatus(childId, "failed");
+    return error("Failed to enqueue child session prompt", 500);
   }
 
-  return json({
-    repos: enrichedRepos,
-    cached: false,
-    cachedAt,
-  });
+  if (!promptResponse.ok) {
+    logger.error("Failed to enqueue initial prompt for child session", {
+      event: "session.spawn_child_prompt_enqueue_failed",
+      parent_id: parentId,
+      child_id: childId,
+      prompt_status: promptResponse.status,
+      trace_id: ctx.trace_id,
+      request_id: ctx.request_id,
+    });
+    await sessionStore.updateStatus(childId, "failed");
+    return error("Failed to enqueue child session prompt", 500);
+  }
+
+  // Notify parent session so connected clients can refresh child list
+  ctx.executionCtx?.waitUntil(
+    parentStub
+      .fetch(
+        internalRequest(
+          buildSessionInternalUrl(SessionInternalPaths.childSessionUpdate),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              childSessionId: childId,
+              status: "created",
+              title: body.title,
+            }),
+          },
+          ctx
+        )
+      )
+      .catch((err) => {
+        logger.error("session.notify_parent_spawn.failed", { error: err });
+      })
+  );
+
+  return json({ sessionId: childId, status: "created" }, 201);
 }
 
-/**
- * Update metadata for a specific repository.
- * This allows storing custom descriptions, aliases, and channel associations.
- */
-async function handleUpdateRepoMetadata(
-  request: Request,
+async function handleListChildren(
+  _request: Request,
   env: Env,
   match: RegExpMatchArray,
   _ctx: RequestContext
 ): Promise<Response> {
-  const owner = match.groups?.owner;
-  const name = match.groups?.name;
+  const parentId = match.groups?.id;
+  if (!parentId) return error("Parent session ID required");
 
-  if (!owner || !name) {
-    return error("Owner and name are required");
-  }
+  const sessionStore = new SessionIndexStore(env.DB);
+  const children = await sessionStore.listByParent(parentId);
 
-  const body = (await request.json()) as RepoMetadata;
-
-  // Validate and clean the metadata structure (remove undefined fields)
-  const metadata = Object.fromEntries(
-    Object.entries({
-      description: body.description,
-      aliases: Array.isArray(body.aliases) ? body.aliases : undefined,
-      channelAssociations: Array.isArray(body.channelAssociations)
-        ? body.channelAssociations
-        : undefined,
-      keywords: Array.isArray(body.keywords) ? body.keywords : undefined,
-    }).filter(([, v]) => v !== undefined)
-  ) as RepoMetadata;
-
-  const metadataStore = new RepoMetadataStore(env.DB);
-
-  try {
-    await metadataStore.upsert(owner, name, metadata);
-
-    // Invalidate the KV repos cache so next fetch includes updated metadata
-    await env.REPOS_CACHE.delete(REPOS_CACHE_KEY);
-
-    // Return normalized repo identifier
-    const normalizedRepo = `${owner.toLowerCase()}/${name.toLowerCase()}`;
-    return json({
-      status: "updated",
-      repo: normalizedRepo,
-      metadata,
-    });
-  } catch (e) {
-    logger.error("Failed to update repo metadata", {
-      error: e instanceof Error ? e : String(e),
-    });
-    return error("Failed to update metadata", 500);
-  }
+  return json({ children });
 }
 
-/**
- * Get metadata for a specific repository.
- */
-async function handleGetRepoMetadata(
-  request: Request,
-  env: Env,
-  match: RegExpMatchArray,
-  _ctx: RequestContext
-): Promise<Response> {
-  const owner = match.groups?.owner;
-  const name = match.groups?.name;
-
-  if (!owner || !name) {
-    return error("Owner and name are required");
-  }
-
-  const normalizedRepo = `${owner.toLowerCase()}/${name.toLowerCase()}`;
-  const metadataStore = new RepoMetadataStore(env.DB);
-
-  try {
-    const metadata = await metadataStore.get(owner, name);
-
-    return json({
-      repo: normalizedRepo,
-      metadata: metadata ?? null,
-    });
-  } catch (e) {
-    logger.error("Failed to get repo metadata", { error: e instanceof Error ? e : String(e) });
-    return error("Failed to get metadata", 500);
-  }
-}
-
-/**
- * Upsert secrets for a repository.
- */
-async function handleSetRepoSecrets(
-  request: Request,
-  env: Env,
-  match: RegExpMatchArray,
-  ctx: RequestContext
-): Promise<Response> {
-  if (!env.DB) {
-    return error("Secrets storage is not configured", 503);
-  }
-  if (!env.REPO_SECRETS_ENCRYPTION_KEY) {
-    return error("REPO_SECRETS_ENCRYPTION_KEY not configured", 500);
-  }
-
-  const owner = match.groups?.owner;
-  const name = match.groups?.name;
-  if (!owner || !name) {
-    return error("Owner and name are required");
-  }
-
-  let resolved;
-  try {
-    resolved = await resolveInstalledRepo(env, owner, name);
-    if (!resolved) {
-      return error("Repository is not installed for the GitHub App", 404);
-    }
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    logger.error("Failed to resolve repository for secrets", {
-      error: message,
-      repo_owner: owner,
-      repo_name: name,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-    return error(
-      message === "GitHub App not configured" ? message : "Failed to resolve repository",
-      500
-    );
-  }
-
-  let body: { secrets?: Record<string, string> };
-  try {
-    body = (await request.json()) as { secrets?: Record<string, string> };
-  } catch {
-    return error("Invalid JSON body", 400);
-  }
-
-  if (!body?.secrets || typeof body.secrets !== "object") {
-    return error("Request body must include secrets object", 400);
-  }
-
-  const store = new RepoSecretsStore(env.DB, env.REPO_SECRETS_ENCRYPTION_KEY);
-
-  try {
-    const result = await store.setSecrets(
-      resolved.repoId,
-      resolved.repoOwner,
-      resolved.repoName,
-      body.secrets
-    );
-
-    logger.info("repo.secrets_updated", {
-      event: "repo.secrets_updated",
-      repo_id: resolved.repoId,
-      repo_owner: resolved.repoOwner,
-      repo_name: resolved.repoName,
-      keys_count: result.keys.length,
-      created: result.created,
-      updated: result.updated,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-
-    return json({
-      status: "updated",
-      repo: `${resolved.repoOwner}/${resolved.repoName}`,
-      keys: result.keys,
-      created: result.created,
-      updated: result.updated,
-    });
-  } catch (e) {
-    if (e instanceof SecretsValidationError) {
-      return error(e.message, 400);
-    }
-    logger.error("Failed to update repo secrets", {
-      error: e instanceof Error ? e.message : String(e),
-      repo_id: resolved.repoId,
-      repo_owner: resolved.repoOwner,
-      repo_name: resolved.repoName,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-    return error("Secrets storage unavailable", 503);
-  }
-}
-
-/**
- * List secret keys for a repository.
- */
-async function handleListRepoSecrets(
+async function handleGetChild(
   _request: Request,
   env: Env,
   match: RegExpMatchArray,
   ctx: RequestContext
 ): Promise<Response> {
-  if (!env.DB) {
-    return error("Secrets storage is not configured", 503);
-  }
-  if (!env.REPO_SECRETS_ENCRYPTION_KEY) {
-    return error("REPO_SECRETS_ENCRYPTION_KEY not configured", 500);
-  }
+  const parentId = match.groups?.id;
+  const childId = match.groups?.childId;
+  if (!parentId || !childId) return error("Parent and child session IDs required");
 
-  const owner = match.groups?.owner;
-  const name = match.groups?.name;
-  if (!owner || !name) {
-    return error("Owner and name are required");
+  const sessionStore = new SessionIndexStore(env.DB);
+  const isChild = await sessionStore.isChildOf(childId, parentId);
+  if (!isChild) {
+    return error("Child session not found", 404);
   }
 
-  let resolved;
-  try {
-    resolved = await resolveInstalledRepo(env, owner, name);
-    if (!resolved) {
-      return error("Repository is not installed for the GitHub App", 404);
-    }
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    logger.error("Failed to resolve repository for secrets list", {
-      error: message,
-      repo_owner: owner,
-      repo_name: name,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-    return error(
-      message === "GitHub App not configured" ? message : "Failed to resolve repository",
-      500
-    );
-  }
+  // Fetch child summary from child DO
+  const childDoId = env.SESSION.idFromName(childId);
+  const childStub = env.SESSION.get(childDoId);
 
-  const store = new RepoSecretsStore(env.DB, env.REPO_SECRETS_ENCRYPTION_KEY);
-  const globalStore = new GlobalSecretsStore(env.DB, env.REPO_SECRETS_ENCRYPTION_KEY);
+  const response = await childStub.fetch(
+    internalRequest(buildSessionInternalUrl(SessionInternalPaths.childSummary), undefined, ctx)
+  );
 
-  try {
-    const [secrets, globalSecrets] = await Promise.all([
-      store.listSecretKeys(resolved.repoId),
-      globalStore.listSecretKeys().catch((e) => {
-        logger.warn("Failed to fetch global secrets for repo list", {
-          error: e instanceof Error ? e.message : String(e),
-        });
-        return [];
-      }),
-    ]);
-
-    logger.info("repo.secrets_listed", {
-      event: "repo.secrets_listed",
-      repo_id: resolved.repoId,
-      repo_owner: resolved.repoOwner,
-      repo_name: resolved.repoName,
-      keys_count: secrets.length,
-      global_keys_count: globalSecrets.length,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-
-    return json({
-      repo: `${resolved.repoOwner}/${resolved.repoName}`,
-      secrets,
-      globalSecrets,
-    });
-  } catch (e) {
-    logger.error("Failed to list repo secrets", {
-      error: e instanceof Error ? e.message : String(e),
-      repo_id: resolved.repoId,
-      repo_owner: resolved.repoOwner,
-      repo_name: resolved.repoName,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-    return error("Secrets storage unavailable", 503);
-  }
+  return response;
 }
 
-/**
- * Delete a secret for a repository.
- */
-async function handleDeleteRepoSecret(
+async function handleCancelChild(
   _request: Request,
   env: Env,
   match: RegExpMatchArray,
   ctx: RequestContext
 ): Promise<Response> {
-  if (!env.DB) {
-    return error("Secrets storage is not configured", 503);
-  }
-  if (!env.REPO_SECRETS_ENCRYPTION_KEY) {
-    return error("REPO_SECRETS_ENCRYPTION_KEY not configured", 500);
-  }
+  const parentId = match.groups?.id;
+  const childId = match.groups?.childId;
+  if (!parentId || !childId) return error("Parent and child session IDs required");
 
-  const owner = match.groups?.owner;
-  const name = match.groups?.name;
-  const key = match.groups?.key;
-  if (!owner || !name || !key) {
-    return error("Owner, name, and key are required");
+  const sessionStore = new SessionIndexStore(env.DB);
+  const isChild = await sessionStore.isChildOf(childId, parentId);
+  if (!isChild) {
+    return error("Child session not found", 404);
   }
 
-  let resolved;
-  try {
-    resolved = await resolveInstalledRepo(env, owner, name);
-    if (!resolved) {
-      return error("Repository is not installed for the GitHub App", 404);
-    }
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    logger.error("Failed to resolve repository for secrets delete", {
-      error: message,
-      repo_owner: owner,
-      repo_name: name,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-    return error(
-      message === "GitHub App not configured" ? message : "Failed to resolve repository",
-      500
-    );
+  // Cancel via child DO
+  const childDoId = env.SESSION.idFromName(childId);
+  const childStub = env.SESSION.get(childDoId);
+
+  const response = await childStub.fetch(
+    internalRequest(buildSessionInternalUrl(SessionInternalPaths.cancel), { method: "POST" }, ctx)
+  );
+
+  // Update D1 status if cancel succeeded
+  if (response.ok) {
+    await sessionStore.updateStatus(childId, "cancelled");
   }
 
-  const store = new RepoSecretsStore(env.DB, env.REPO_SECRETS_ENCRYPTION_KEY);
-
-  try {
-    const normalizedKey = normalizeKey(key);
-    validateKey(normalizedKey);
-
-    const deleted = await store.deleteSecret(resolved.repoId, key);
-    if (!deleted) {
-      return error("Secret not found", 404);
-    }
-
-    logger.info("repo.secret_deleted", {
-      event: "repo.secret_deleted",
-      repo_id: resolved.repoId,
-      repo_owner: resolved.repoOwner,
-      repo_name: resolved.repoName,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-
-    return json({
-      status: "deleted",
-      repo: `${resolved.repoOwner}/${resolved.repoName}`,
-      key: normalizedKey,
-    });
-  } catch (e) {
-    if (e instanceof SecretsValidationError) {
-      return error(e.message, 400);
-    }
-    logger.error("Failed to delete repo secret", {
-      error: e instanceof Error ? e.message : String(e),
-      repo_id: resolved.repoId,
-      repo_owner: resolved.repoOwner,
-      repo_name: resolved.repoName,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-    return error("Secrets storage unavailable", 503);
-  }
-}
-
-// Global secrets handlers
-
-async function handleSetGlobalSecrets(
-  request: Request,
-  env: Env,
-  _match: RegExpMatchArray,
-  ctx: RequestContext
-): Promise<Response> {
-  if (!env.DB) {
-    return error("Secrets storage is not configured", 503);
-  }
-  if (!env.REPO_SECRETS_ENCRYPTION_KEY) {
-    return error("REPO_SECRETS_ENCRYPTION_KEY not configured", 500);
-  }
-
-  let body: { secrets?: Record<string, string> };
-  try {
-    body = (await request.json()) as { secrets?: Record<string, string> };
-  } catch {
-    return error("Invalid JSON body", 400);
-  }
-
-  if (!body?.secrets || typeof body.secrets !== "object") {
-    return error("Request body must include secrets object", 400);
-  }
-
-  const store = new GlobalSecretsStore(env.DB, env.REPO_SECRETS_ENCRYPTION_KEY);
-
-  try {
-    const result = await store.setSecrets(body.secrets);
-
-    logger.info("global.secrets_updated", {
-      event: "global.secrets_updated",
-      keys_count: result.keys.length,
-      created: result.created,
-      updated: result.updated,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-
-    return json({
-      status: "updated",
-      keys: result.keys,
-      created: result.created,
-      updated: result.updated,
-    });
-  } catch (e) {
-    if (e instanceof SecretsValidationError) {
-      return error(e.message, 400);
-    }
-    logger.error("Failed to update global secrets", {
-      error: e instanceof Error ? e.message : String(e),
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-    return error("Secrets storage unavailable", 503);
-  }
-}
-
-async function handleListGlobalSecrets(
-  _request: Request,
-  env: Env,
-  _match: RegExpMatchArray,
-  ctx: RequestContext
-): Promise<Response> {
-  if (!env.DB) {
-    return error("Secrets storage is not configured", 503);
-  }
-  if (!env.REPO_SECRETS_ENCRYPTION_KEY) {
-    return error("REPO_SECRETS_ENCRYPTION_KEY not configured", 500);
-  }
-
-  const store = new GlobalSecretsStore(env.DB, env.REPO_SECRETS_ENCRYPTION_KEY);
-
-  try {
-    const secrets = await store.listSecretKeys();
-
-    logger.info("global.secrets_listed", {
-      event: "global.secrets_listed",
-      keys_count: secrets.length,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-
-    return json({ secrets });
-  } catch (e) {
-    logger.error("Failed to list global secrets", {
-      error: e instanceof Error ? e.message : String(e),
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-    return error("Secrets storage unavailable", 503);
-  }
-}
-
-async function handleDeleteGlobalSecret(
-  _request: Request,
-  env: Env,
-  match: RegExpMatchArray,
-  ctx: RequestContext
-): Promise<Response> {
-  if (!env.DB) {
-    return error("Secrets storage is not configured", 503);
-  }
-  if (!env.REPO_SECRETS_ENCRYPTION_KEY) {
-    return error("REPO_SECRETS_ENCRYPTION_KEY not configured", 500);
-  }
-
-  const key = match.groups?.key;
-  if (!key) {
-    return error("Key is required");
-  }
-
-  const store = new GlobalSecretsStore(env.DB, env.REPO_SECRETS_ENCRYPTION_KEY);
-
-  try {
-    const normalizedKey = normalizeKey(key);
-    validateKey(normalizedKey);
-
-    const deleted = await store.deleteSecret(key);
-    if (!deleted) {
-      return error("Secret not found", 404);
-    }
-
-    logger.info("global.secret_deleted", {
-      event: "global.secret_deleted",
-      key: normalizedKey,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-
-    return json({
-      status: "deleted",
-      key: normalizedKey,
-    });
-  } catch (e) {
-    if (e instanceof SecretsValidationError) {
-      return error(e.message, 400);
-    }
-    logger.error("Failed to delete global secret", {
-      error: e instanceof Error ? e.message : String(e),
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
-    return error("Secrets storage unavailable", 503);
-  }
+  return response;
 }

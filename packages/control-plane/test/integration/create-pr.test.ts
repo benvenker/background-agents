@@ -88,7 +88,7 @@ describe("POST /internal/create-pr", () => {
     const body = await res.json<{ error: string }>();
     expect(body.error).toBe("User not found. Please re-authenticate.");
   });
-  it("returns 401 when expired OAuth token cannot be refreshed", async () => {
+  it("falls back to app auth when expired OAuth token cannot be refreshed", async () => {
     const { stub } = await initSession({ userId: "user-1" });
 
     const participants = await queryDO<{ id: string }>(
@@ -113,12 +113,52 @@ describe("POST /internal/create-pr", () => {
 
     await runInDurableObject(stub, (instance: SessionDO) => {
       instance.ctx.storage.sql.exec(
-        "UPDATE participants SET github_access_token_encrypted = ?, github_refresh_token_encrypted = ?, github_token_expires_at = ? WHERE id = ?",
+        "UPDATE participants SET scm_access_token_encrypted = ?, scm_refresh_token_encrypted = ?, scm_token_expires_at = ? WHERE id = ?",
         "invalid-access-token",
         "invalid-refresh-token",
         Date.now() - 60_000,
         ownerParticipantId
       );
+
+      // Set up mock provider so the app-token fallback path can complete
+      const mockProvider = {
+        name: "github",
+        generatePushAuth: async () => ({ authType: "app", token: "push-token" as const }),
+        getRepository: async () => ({
+          owner: "acme",
+          name: "web-app",
+          fullName: "acme/web-app",
+          defaultBranch: "main",
+          isPrivate: true,
+          providerRepoId: 12345,
+        }),
+        createPullRequest: async () => ({
+          id: 99,
+          webUrl: "https://github.com/acme/web-app/pull/99",
+          apiUrl: "https://api.github.com/repos/acme/web-app/pulls/99",
+          state: "open" as const,
+          sourceBranch: "open-inspect/test-session",
+          targetBranch: "main",
+        }),
+        buildManualPullRequestUrl: (config: {
+          owner: string;
+          name: string;
+          sourceBranch: string;
+          targetBranch: string;
+        }) =>
+          `https://github.com/${config.owner}/${config.name}/pull/new/${config.targetBranch}...${config.sourceBranch}`,
+        buildGitPushSpec: (config: { targetBranch: string }) => ({
+          remoteUrl: "https://example.invalid/repo.git",
+          redactedRemoteUrl: "https://example.invalid/<redacted>.git",
+          refspec: `HEAD:refs/heads/${config.targetBranch}`,
+          targetBranch: config.targetBranch,
+          force: true,
+        }),
+      } as unknown as SourceControlProvider;
+
+      (
+        instance as unknown as { _sourceControlProvider: SourceControlProvider | null }
+      )._sourceControlProvider = mockProvider;
     });
 
     const res = await stub.fetch("http://internal/internal/create-pr", {
@@ -130,14 +170,14 @@ describe("POST /internal/create-pr", () => {
       }),
     });
 
-    expect(res.status).toBe(401);
-    const body = await res.json<{ error: string }>();
-    expect(body.error).toBe(
-      "Your GitHub token has expired and could not be refreshed. Please re-authenticate."
-    );
+    // Should succeed via app token fallback, not fail with 401
+    expect(res.status).toBe(200);
+    const body = await res.json<{ prNumber: number; prUrl: string; state: string }>();
+    expect(body.prNumber).toBe(99);
+    expect(body.prUrl).toBe("https://github.com/acme/web-app/pull/99");
   });
 
-  it("returns manual fallback and stores branch artifact when prompting user has no OAuth token", async () => {
+  it("creates PR with app auth when prompting user has no OAuth token", async () => {
     const { stub } = await initSession({ userId: "user-1" });
 
     const participants = await queryDO<{ id: string }>(
@@ -172,9 +212,14 @@ describe("POST /internal/create-pr", () => {
           isPrivate: true,
           providerRepoId: 12345,
         }),
-        createPullRequest: async () => {
-          throw new Error("createPullRequest should not be called for manual fallback");
-        },
+        createPullRequest: async () => ({
+          id: 42,
+          webUrl: "https://github.com/acme/web-app/pull/42",
+          apiUrl: "https://api.github.com/repos/acme/web-app/pulls/42",
+          state: "open" as const,
+          sourceBranch: "open-inspect/test-session",
+          targetBranch: "main",
+        }),
         buildManualPullRequestUrl: (config: {
           owner: string;
           name: string;
@@ -207,22 +252,20 @@ describe("POST /internal/create-pr", () => {
 
     expect(res.status).toBe(200);
     const body = await res.json<{
-      status: string;
-      createPrUrl: string;
-      headBranch: string;
-      baseBranch: string;
+      prNumber: number;
+      prUrl: string;
+      state: string;
     }>();
-    expect(body.status).toBe("manual");
-    expect(body.createPrUrl).toContain("/pull/new/");
-    expect(body.headBranch.length).toBeGreaterThan(0);
-    expect(body.baseBranch).toBe("main");
+    expect(body.prNumber).toBe(42);
+    expect(body.prUrl).toBe("https://github.com/acme/web-app/pull/42");
+    expect(body.state).toBe("open");
 
     const artifacts = await queryDO<{ type: string; metadata: string | null }>(
       stub,
       "SELECT type, metadata FROM artifacts ORDER BY created_at DESC LIMIT 1"
     );
-    expect(artifacts[0]?.type).toBe("branch");
-    expect(artifacts[0]?.metadata).toContain('"mode":"manual_pr"');
+    expect(artifacts[0]?.type).toBe("pr");
+    expect(artifacts[0]?.metadata).toContain('"number":42');
   });
 
   it("returns 409 when a PR artifact already exists", async () => {

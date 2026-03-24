@@ -115,8 +115,8 @@ function createMockRepository() {
         participant_id: data.participantId,
         client_id: data.clientId,
         user_id: `user-${data.participantId}`,
-        github_name: null,
-        github_login: null,
+        scm_name: null,
+        scm_login: null,
       });
     },
   } as unknown as SessionRepository;
@@ -157,12 +157,15 @@ function createSandboxRow(modalSandboxId: string): SandboxRow {
     snapshot_id: null,
     snapshot_image_id: null,
     auth_token: null,
+    auth_token_hash: null,
     status: "ready",
     git_sync_status: "completed",
     last_heartbeat: null,
     last_activity: null,
     last_spawn_error: null,
     last_spawn_error_at: null,
+    code_server_url: null,
+    code_server_password: null,
     created_at: Date.now(),
   };
 }
@@ -438,8 +441,8 @@ describe("SessionWebSocketManagerImpl", () => {
         participant_id: "part-1",
         client_id: "client-1",
         user_id: "user-1",
-        github_name: "Test",
-        github_login: "testuser",
+        scm_name: "Test",
+        scm_login: "testuser",
       };
       mockRepo.addMapping("ws-42", mapping);
 
@@ -496,8 +499,8 @@ describe("SessionWebSocketManagerImpl", () => {
         participant_id: "p-1",
         client_id: "c-1",
         user_id: "u-1",
-        github_name: null,
-        github_login: null,
+        scm_name: null,
+        scm_login: null,
       });
 
       expect(manager.hasPersistedMapping("ws-1")).toBe(true);
@@ -616,8 +619,8 @@ describe("SessionWebSocketManagerImpl", () => {
         participant_id: "p-1",
         client_id: "c-1",
         user_id: "u-1",
-        github_name: null,
-        github_login: null,
+        scm_name: null,
+        scm_login: null,
       });
 
       const called: WebSocket[] = [];
@@ -653,8 +656,8 @@ describe("SessionWebSocketManagerImpl", () => {
         participant_id: "p-2",
         client_id: "c-2",
         user_id: "u-2",
-        github_name: null,
-        github_login: null,
+        scm_name: null,
+        scm_login: null,
       });
 
       // Unauthenticated client (connected but never subscribed)
@@ -715,8 +718,8 @@ describe("SessionWebSocketManagerImpl", () => {
         participant_id: "p-1",
         client_id: "c-1",
         user_id: "u-1",
-        github_name: null,
-        github_login: null,
+        scm_name: null,
+        scm_login: null,
       });
 
       await manager.enforceAuthTimeout(ws, "ws-1");

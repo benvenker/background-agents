@@ -1,6 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ClipboardEvent } from "react";
+import useSWR, { mutate } from "swr";
+import { toast } from "sonner";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+
+import { normalizeKey, parseMaybeEnvContent, type ParsedEnvEntry } from "@/lib/env-paste";
 
 const VALID_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_KEY_LENGTH = 256;
@@ -41,8 +47,9 @@ type GlobalSecretMeta = {
   updatedAt: number;
 };
 
-function normalizeKey(value: string) {
-  return value.trim().toUpperCase();
+interface SecretsResponse {
+  secrets: { key: string }[];
+  globalSecrets?: GlobalSecretMeta[];
 }
 
 function validateKey(value: string): string | null {
@@ -83,11 +90,8 @@ export function SecretsEditor({
   scope?: "repo" | "global";
 }) {
   const [rows, setRows] = useState<SecretRow[]>([]);
-  const [globalRows, setGlobalRows] = useState<GlobalSecretMeta[]>([]);
-  const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  const [success, setSuccess] = useState("");
   const [deletingKey, setDeletingKey] = useState<string | null>(null);
 
   const isGlobal = scope === "global";
@@ -96,73 +100,114 @@ export function SecretsEditor({
 
   const apiBase = isGlobal ? "/api/secrets" : `/api/repos/${owner}/${name}/secrets`;
 
-  const loadSecrets = useCallback(async () => {
-    if (!ready) {
-      setRows([]);
-      setGlobalRows([]);
-      return;
-    }
+  const {
+    data: secretsData,
+    isLoading: loading,
+    error: fetchError,
+  } = useSWR<SecretsResponse>(ready ? apiBase : null);
 
-    setLoading(true);
-    setError("");
-    setSuccess("");
-
-    try {
-      const response = await fetch(apiBase);
-      const data = await response.json();
-
-      if (!response.ok) {
-        setError(data?.error || "Failed to load secrets");
-        setRows([]);
-        setGlobalRows([]);
-        return;
-      }
-
-      const secrets = Array.isArray(data?.secrets) ? data.secrets : [];
-      setRows(
-        secrets.map((secret: { key: string }) =>
-          createRow({ key: secret.key, value: "", existing: true })
-        )
-      );
-
-      // Piggybacked global keys from repo secrets endpoint
-      if (!isGlobal && Array.isArray(data?.globalSecrets)) {
-        setGlobalRows(data.globalSecrets);
-      } else {
-        setGlobalRows([]);
-      }
-    } catch {
-      setError("Failed to load secrets");
-      setRows([]);
-      setGlobalRows([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [ready, apiBase, isGlobal]);
-
+  // Sync SWR data into local editable rows
+  const secrets = secretsData?.secrets;
   useEffect(() => {
-    if (!ready) {
+    if (!Array.isArray(secrets)) {
       setRows([]);
-      setGlobalRows([]);
-      setError("");
-      setSuccess("");
       return;
     }
+    setRows(
+      secrets.map((secret: { key: string }) =>
+        createRow({ key: secret.key, value: "", existing: true })
+      )
+    );
+  }, [secrets]);
 
-    let active = true;
-    (async () => {
-      await loadSecrets();
-      if (!active) return;
-    })();
+  // Show fetch errors to the user
+  useEffect(() => {
+    if (fetchError) {
+      setError("Failed to load secrets");
+    }
+  }, [fetchError]);
 
-    return () => {
-      active = false;
-    };
-  }, [ready, loadSecrets]);
+  const globalRows: GlobalSecretMeta[] =
+    !isGlobal && Array.isArray(secretsData?.globalSecrets) ? secretsData.globalSecrets : [];
 
   const existingKeySet = useMemo(() => {
     return new Set(rows.filter((row) => row.existing).map((row) => normalizeKey(row.key)));
   }, [rows]);
+
+  const applyEnvEntries = useCallback((entries: ParsedEnvEntry[]) => {
+    setRows((current) => {
+      const next = [...current];
+      const keyToIndex = new Map<string, number>();
+
+      next.forEach((row, index) => {
+        const normalized = normalizeKey(row.key);
+        if (normalized) {
+          keyToIndex.set(normalized, index);
+        }
+      });
+
+      for (const entry of entries) {
+        const normalizedKey = normalizeKey(entry.key);
+        const existingIndex = keyToIndex.get(normalizedKey);
+
+        if (existingIndex !== undefined) {
+          next[existingIndex] = {
+            ...next[existingIndex],
+            key: normalizedKey,
+            value: entry.value,
+          };
+          continue;
+        }
+
+        const emptyRowIndex = next.findIndex(
+          (row) => !row.existing && row.key.trim() === "" && row.value.trim() === ""
+        );
+
+        if (emptyRowIndex >= 0) {
+          next[emptyRowIndex] = {
+            ...next[emptyRowIndex],
+            key: normalizedKey,
+            value: entry.value,
+          };
+          keyToIndex.set(normalizedKey, emptyRowIndex);
+          continue;
+        }
+
+        next.push(createRow({ key: normalizedKey, value: entry.value }));
+        keyToIndex.set(normalizedKey, next.length - 1);
+      }
+
+      return next;
+    });
+  }, []);
+
+  const handlePasteIntoRow = useCallback(
+    (event: ClipboardEvent<HTMLInputElement>) => {
+      const pastedText = event.clipboardData.getData("text");
+      const parsed = parseMaybeEnvContent(pastedText);
+      if (parsed.length === 0) {
+        return;
+      }
+
+      const valid = parsed.filter((entry) => !RESERVED_KEYS.has(entry.key));
+      const skipped = parsed.length - valid.length;
+
+      if (valid.length === 0 && skipped > 0) {
+        event.preventDefault();
+        setError(`All ${skipped} pasted key${skipped === 1 ? " is" : "s are"} reserved`);
+        return;
+      }
+
+      event.preventDefault();
+      applyEnvEntries(valid);
+      setError("");
+
+      const imported = `Imported ${valid.length} secret${valid.length === 1 ? "" : "s"} from paste`;
+      const skippedMsg = skipped > 0 ? ` (skipped ${skipped} reserved)` : "";
+      toast.success(imported + skippedMsg);
+    },
+    [applyEnvEntries]
+  );
 
   const handleAddRow = () => {
     setRows((current) => [...current, createRow()]);
@@ -179,7 +224,6 @@ export function SecretsEditor({
     const normalizedKey = normalizeKey(row.key);
     setDeletingKey(normalizedKey);
     setError("");
-    setSuccess("");
 
     try {
       const response = await fetch(`${apiBase}/${normalizedKey}`, {
@@ -187,13 +231,13 @@ export function SecretsEditor({
       });
       const data = await response.json();
       if (!response.ok) {
-        setError(data?.error || "Failed to delete secret");
+        toast.error(data?.error || "Failed to delete secret");
         return;
       }
-      setSuccess(`Deleted ${normalizedKey}`);
-      await loadSecrets();
+      toast.success(`Deleted ${normalizedKey}`);
+      mutate(apiBase);
     } catch {
-      setError("Failed to delete secret");
+      toast.error("Failed to delete secret");
     } finally {
       setDeletingKey(null);
     }
@@ -203,7 +247,6 @@ export function SecretsEditor({
     if (!ready) return;
 
     setError("");
-    setSuccess("");
 
     const entries = rows
       .filter((row) => row.value.trim().length > 0)
@@ -214,7 +257,7 @@ export function SecretsEditor({
       }));
 
     if (entries.length === 0) {
-      setSuccess("No changes to save");
+      toast("No changes to save");
       return;
     }
 
@@ -276,14 +319,14 @@ export function SecretsEditor({
       const data = await response.json();
 
       if (!response.ok) {
-        setError(data?.error || "Failed to update secrets");
+        toast.error(data?.error || "Failed to update secrets");
         return;
       }
 
-      setSuccess("Secrets updated");
-      await loadSecrets();
+      toast.success("Secrets updated");
+      mutate(apiBase);
     } catch {
-      setError("Failed to update secrets");
+      toast.error("Failed to update secrets");
     } finally {
       setSaving(false);
     }
@@ -328,7 +371,7 @@ export function SecretsEditor({
             {rows.map((row) => (
               <div key={row.id} className="flex flex-col gap-2 border border-border-muted p-2">
                 <div className="flex flex-wrap gap-2">
-                  <input
+                  <Input
                     type="text"
                     value={row.key}
                     onChange={(e) => {
@@ -349,9 +392,10 @@ export function SecretsEditor({
                     }}
                     placeholder="KEY_NAME"
                     disabled={disabled || row.existing}
-                    className="flex-1 min-w-[160px] bg-input border border-border px-2 py-1 text-xs text-foreground disabled:opacity-60"
+                    onPaste={handlePasteIntoRow}
+                    className="flex-1 min-w-[160px] h-auto px-2 py-1 text-xs"
                   />
-                  <input
+                  <Input
                     type="password"
                     value={row.value}
                     onChange={(e) => {
@@ -362,7 +406,8 @@ export function SecretsEditor({
                     }}
                     placeholder={row.existing ? "••••••••" : "value"}
                     disabled={disabled}
-                    className="flex-1 min-w-[200px] bg-input border border-border px-2 py-1 text-xs text-foreground disabled:opacity-60"
+                    onPaste={handlePasteIntoRow}
+                    className="flex-1 min-w-[200px] h-auto px-2 py-1 text-xs"
                   />
                   <button
                     type="button"
@@ -396,16 +441,16 @@ export function SecretsEditor({
                         overridden ? "opacity-40" : "opacity-70"
                       }`}
                     >
-                      <span className="text-[10px] font-medium px-1.5 py-0.5 bg-blue-500/10 text-blue-600 border border-blue-500/20">
+                      <Badge variant="info" className="text-[10px]">
                         Global
-                      </span>
+                      </Badge>
                       <span className="text-xs text-foreground font-mono">{g.key}</span>
-                      <input
+                      <Input
                         type="password"
                         value=""
                         placeholder="••••••••"
                         disabled
-                        className="flex-1 min-w-[200px] bg-input border border-border px-2 py-1 text-xs text-foreground disabled:opacity-60"
+                        className="flex-1 min-w-[200px] h-auto px-2 py-1 text-xs"
                       />
                       {overridden && (
                         <span className="text-[10px] text-muted-foreground">
@@ -420,7 +465,6 @@ export function SecretsEditor({
           )}
 
           {error && <p className="mt-3 text-xs text-red-500">{error}</p>}
-          {success && <p className="mt-3 text-xs text-green-600">{success}</p>}
 
           <div className="mt-3 flex items-center gap-2">
             <button
@@ -432,7 +476,7 @@ export function SecretsEditor({
               {saving ? "Saving..." : "Save secrets"}
             </button>
             <span className="text-[11px] text-muted-foreground">
-              Keys are automatically uppercased.
+              Keys are automatically uppercased. Paste a `.env` block into either field to import.
             </span>
           </div>
         </>

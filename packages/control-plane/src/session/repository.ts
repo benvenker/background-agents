@@ -20,8 +20,14 @@ import type {
   MessageStatus,
   MessageSource,
   ParticipantRole,
+  SpawnSource,
   ArtifactType,
+  SandboxEvent,
 } from "../types";
+
+type TokenEvent = Extract<SandboxEvent, { type: "token" }>;
+type ExecutionCompleteEvent = Extract<SandboxEvent, { type: "execution_complete" }>;
+type UpsertableEventType = TokenEvent["type"] | ExecutionCompleteEvent["type"];
 
 /**
  * WS client mapping result for hibernation recovery.
@@ -30,8 +36,8 @@ export interface WsClientMappingResult {
   participant_id: string;
   client_id: string;
   user_id: string;
-  github_name: string | null;
-  github_login: string | null;
+  scm_name: string | null;
+  scm_login: string | null;
 }
 
 /**
@@ -56,9 +62,14 @@ export interface UpsertSessionData {
   repoOwner: string;
   repoName: string;
   repoId?: number | null;
+  baseBranch?: string;
   model: string;
   reasoningEffort?: string | null;
   status: SessionStatus;
+  parentSessionId?: string | null;
+  spawnSource?: SpawnSource;
+  spawnDepth?: number;
+  codeServerEnabled?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -79,13 +90,13 @@ export interface CreateSandboxData {
 export interface CreateParticipantData {
   id: string;
   userId: string;
-  githubUserId?: string | null;
-  githubLogin?: string | null;
-  githubName?: string | null;
-  githubEmail?: string | null;
-  githubAccessTokenEncrypted?: string | null;
-  githubRefreshTokenEncrypted?: string | null;
-  githubTokenExpiresAt?: number | null;
+  scmUserId?: string | null;
+  scmLogin?: string | null;
+  scmName?: string | null;
+  scmEmail?: string | null;
+  scmAccessTokenEncrypted?: string | null;
+  scmRefreshTokenEncrypted?: string | null;
+  scmTokenExpiresAt?: number | null;
   role: ParticipantRole;
   joinedAt: number;
 }
@@ -94,13 +105,13 @@ export interface CreateParticipantData {
  * Data for updating a participant with COALESCE (only non-null values update).
  */
 export interface UpdateParticipantData {
-  githubUserId?: string | null;
-  githubLogin?: string | null;
-  githubName?: string | null;
-  githubEmail?: string | null;
-  githubAccessTokenEncrypted?: string | null;
-  githubRefreshTokenEncrypted?: string | null;
-  githubTokenExpiresAt?: number | null;
+  scmUserId?: string | null;
+  scmLogin?: string | null;
+  scmName?: string | null;
+  scmEmail?: string | null;
+  scmAccessTokenEncrypted?: string | null;
+  scmRefreshTokenEncrypted?: string | null;
+  scmTokenExpiresAt?: number | null;
 }
 
 /**
@@ -178,7 +189,7 @@ export interface WsClientMappingData {
 export interface SpawnSandboxData {
   status: SandboxStatus;
   createdAt: number;
-  authToken: string;
+  authTokenHash: string;
   modalSandboxId: string;
 }
 
@@ -201,27 +212,36 @@ export interface SqlResult {
 export class SessionRepository {
   constructor(private readonly sql: SqlStorage) {}
 
+  private rows<T>(result: SqlResult): T[] {
+    return result.toArray() as T[];
+  }
+
   // === SESSION ===
 
   getSession(): SessionRow | null {
     const result = this.sql.exec(`SELECT * FROM session LIMIT 1`);
-    const rows = result.toArray() as unknown as SessionRow[];
+    const rows = this.rows<SessionRow>(result);
     return rows[0] ?? null;
   }
 
   upsertSession(data: UpsertSessionData): void {
     this.sql.exec(
-      `INSERT OR REPLACE INTO session (id, session_name, title, repo_owner, repo_name, repo_id, model, reasoning_effort, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO session (id, session_name, title, repo_owner, repo_name, repo_id, base_branch, model, reasoning_effort, status, parent_session_id, spawn_source, spawn_depth, code_server_enabled, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       data.id,
       data.sessionName,
       data.title,
       data.repoOwner,
       data.repoName,
       data.repoId ?? null,
+      data.baseBranch ?? "main",
       data.model,
       data.reasoningEffort ?? null,
       data.status,
+      data.parentSessionId ?? null,
+      data.spawnSource ?? "user",
+      data.spawnDepth ?? 0,
+      data.codeServerEnabled ? 1 : 0,
       data.createdAt,
       data.updatedAt
     );
@@ -246,6 +266,15 @@ export class SessionRepository {
     );
   }
 
+  updateSessionTitle(sessionId: string, title: string, updatedAt: number): void {
+    this.sql.exec(
+      `UPDATE session SET title = ?, updated_at = ? WHERE id = ?`,
+      title,
+      updatedAt,
+      sessionId
+    );
+  }
+
   updateSessionStatus(sessionId: string, status: SessionStatus, updatedAt: number): void {
     this.sql.exec(
       `UPDATE session SET status = ?, updated_at = ? WHERE id = ?`,
@@ -261,7 +290,7 @@ export class SessionRepository {
 
   getSandbox(): SandboxRow | null {
     const result = this.sql.exec(`SELECT * FROM sandbox LIMIT 1`);
-    const rows = result.toArray() as unknown as SandboxRow[];
+    const rows = this.rows<SandboxRow>(result);
     return rows[0] ?? null;
   }
 
@@ -269,7 +298,7 @@ export class SessionRepository {
     const result = this.sql.exec(
       `SELECT status, created_at, snapshot_image_id, spawn_failure_count, last_spawn_failure FROM sandbox LIMIT 1`
     );
-    const rows = result.toArray() as unknown as SandboxCircuitBreakerState[];
+    const rows = this.rows<SandboxCircuitBreakerState>(result);
     return rows[0] ?? null;
   }
 
@@ -296,12 +325,13 @@ export class SessionRepository {
       `UPDATE sandbox SET
          status = ?,
          created_at = ?,
-         auth_token = ?,
+         auth_token_hash = ?,
+         auth_token = NULL,
          modal_sandbox_id = ?
        WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
       data.status,
       data.createdAt,
-      data.authToken,
+      data.authTokenHash,
       data.modalSandboxId
     );
   }
@@ -346,6 +376,20 @@ export class SessionRepository {
     );
   }
 
+  updateSandboxCodeServer(url: string, password: string): void {
+    this.sql.exec(
+      `UPDATE sandbox SET code_server_url = ?, code_server_password = ? WHERE id = (SELECT id FROM sandbox LIMIT 1)`,
+      url,
+      password
+    );
+  }
+
+  clearSandboxCodeServer(): void {
+    this.sql.exec(
+      `UPDATE sandbox SET code_server_url = NULL, code_server_password = NULL WHERE id = (SELECT id FROM sandbox LIMIT 1)`
+    );
+  }
+
   resetCircuitBreaker(): void {
     this.sql.exec(
       `UPDATE sandbox SET spawn_failure_count = 0 WHERE id = (SELECT id FROM sandbox LIMIT 1)`
@@ -366,35 +410,35 @@ export class SessionRepository {
 
   getParticipantByUserId(userId: string): ParticipantRow | null {
     const result = this.sql.exec(`SELECT * FROM participants WHERE user_id = ?`, userId);
-    const rows = result.toArray() as unknown as ParticipantRow[];
+    const rows = this.rows<ParticipantRow>(result);
     return rows[0] ?? null;
   }
 
   getParticipantByWsTokenHash(tokenHash: string): ParticipantRow | null {
     const result = this.sql.exec(`SELECT * FROM participants WHERE ws_auth_token = ?`, tokenHash);
-    const rows = result.toArray() as unknown as ParticipantRow[];
+    const rows = this.rows<ParticipantRow>(result);
     return rows[0] ?? null;
   }
 
   getParticipantById(participantId: string): ParticipantRow | null {
     const result = this.sql.exec(`SELECT * FROM participants WHERE id = ?`, participantId);
-    const rows = result.toArray() as unknown as ParticipantRow[];
+    const rows = this.rows<ParticipantRow>(result);
     return rows[0] ?? null;
   }
 
   createParticipant(data: CreateParticipantData): void {
     this.sql.exec(
-      `INSERT INTO participants (id, user_id, github_user_id, github_login, github_name, github_email, github_access_token_encrypted, github_refresh_token_encrypted, github_token_expires_at, role, joined_at)
+      `INSERT INTO participants (id, user_id, scm_user_id, scm_login, scm_name, scm_email, scm_access_token_encrypted, scm_refresh_token_encrypted, scm_token_expires_at, role, joined_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       data.id,
       data.userId,
-      data.githubUserId ?? null,
-      data.githubLogin ?? null,
-      data.githubName ?? null,
-      data.githubEmail ?? null,
-      data.githubAccessTokenEncrypted ?? null,
-      data.githubRefreshTokenEncrypted ?? null,
-      data.githubTokenExpiresAt ?? null,
+      data.scmUserId ?? null,
+      data.scmLogin ?? null,
+      data.scmName ?? null,
+      data.scmEmail ?? null,
+      data.scmAccessTokenEncrypted ?? null,
+      data.scmRefreshTokenEncrypted ?? null,
+      data.scmTokenExpiresAt ?? null,
       data.role,
       data.joinedAt
     );
@@ -403,21 +447,21 @@ export class SessionRepository {
   updateParticipantCoalesce(participantId: string, data: UpdateParticipantData): void {
     this.sql.exec(
       `UPDATE participants SET
-         github_user_id = COALESCE(?, github_user_id),
-         github_login = COALESCE(?, github_login),
-         github_name = COALESCE(?, github_name),
-         github_email = COALESCE(?, github_email),
-         github_access_token_encrypted = COALESCE(?, github_access_token_encrypted),
-         github_refresh_token_encrypted = COALESCE(?, github_refresh_token_encrypted),
-         github_token_expires_at = COALESCE(?, github_token_expires_at)
+         scm_user_id = COALESCE(?, scm_user_id),
+         scm_login = COALESCE(?, scm_login),
+         scm_name = COALESCE(?, scm_name),
+         scm_email = COALESCE(?, scm_email),
+         scm_access_token_encrypted = COALESCE(?, scm_access_token_encrypted),
+         scm_refresh_token_encrypted = COALESCE(?, scm_refresh_token_encrypted),
+         scm_token_expires_at = COALESCE(?, scm_token_expires_at)
        WHERE id = ?`,
-      data.githubUserId ?? null,
-      data.githubLogin ?? null,
-      data.githubName ?? null,
-      data.githubEmail ?? null,
-      data.githubAccessTokenEncrypted ?? null,
-      data.githubRefreshTokenEncrypted ?? null,
-      data.githubTokenExpiresAt ?? null,
+      data.scmUserId ?? null,
+      data.scmLogin ?? null,
+      data.scmName ?? null,
+      data.scmEmail ?? null,
+      data.scmAccessTokenEncrypted ?? null,
+      data.scmRefreshTokenEncrypted ?? null,
+      data.scmTokenExpiresAt ?? null,
       participantId
     );
   }
@@ -425,20 +469,20 @@ export class SessionRepository {
   updateParticipantTokens(
     participantId: string,
     data: {
-      githubAccessTokenEncrypted: string;
-      githubRefreshTokenEncrypted?: string | null;
-      githubTokenExpiresAt: number;
+      scmAccessTokenEncrypted: string;
+      scmRefreshTokenEncrypted?: string | null;
+      scmTokenExpiresAt: number;
     }
   ): void {
     this.sql.exec(
       `UPDATE participants SET
-         github_access_token_encrypted = ?,
-         github_refresh_token_encrypted = COALESCE(?, github_refresh_token_encrypted),
-         github_token_expires_at = ?
+         scm_access_token_encrypted = ?,
+         scm_refresh_token_encrypted = COALESCE(?, scm_refresh_token_encrypted),
+         scm_token_expires_at = ?
        WHERE id = ?`,
-      data.githubAccessTokenEncrypted,
-      data.githubRefreshTokenEncrypted ?? null,
-      data.githubTokenExpiresAt,
+      data.scmAccessTokenEncrypted,
+      data.scmRefreshTokenEncrypted ?? null,
+      data.scmTokenExpiresAt,
       participantId
     );
   }
@@ -454,7 +498,7 @@ export class SessionRepository {
 
   listParticipants(): ParticipantRow[] {
     const result = this.sql.exec(`SELECT * FROM participants ORDER BY joined_at`);
-    return result.toArray() as unknown as ParticipantRow[];
+    return this.rows<ParticipantRow>(result);
   }
 
   // === MESSAGES ===
@@ -477,17 +521,33 @@ export class SessionRepository {
     return rows[0] ?? null;
   }
 
+  getProcessingMessageWithStartedAt(): { id: string; started_at: number } | null {
+    const result = this.sql.exec(
+      `SELECT id, started_at FROM messages WHERE status = 'processing' LIMIT 1`
+    );
+    const rows = result.toArray() as Array<{ id: string; started_at: number }>;
+    return rows[0] ?? null;
+  }
+
   getNextPendingMessage(): MessageRow | null {
     const result = this.sql.exec(
       `SELECT * FROM messages WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1`
     );
-    const rows = result.toArray() as unknown as MessageRow[];
+    const rows = this.rows<MessageRow>(result);
     return rows[0] ?? null;
   }
 
-  getMessageCallbackContext(messageId: string): { callback_context: string | null } | null {
-    const result = this.sql.exec(`SELECT callback_context FROM messages WHERE id = ?`, messageId);
-    const rows = result.toArray() as Array<{ callback_context: string | null }>;
+  getMessageCallbackContext(
+    messageId: string
+  ): { callback_context: string | null; source: string | null } | null {
+    const result = this.sql.exec(
+      `SELECT callback_context, source FROM messages WHERE id = ?`,
+      messageId
+    );
+    const rows = result.toArray() as Array<{
+      callback_context: string | null;
+      source: string | null;
+    }>;
     return rows[0] ?? null;
   }
 
@@ -555,7 +615,7 @@ export class SessionRepository {
     params.push(options.limit + 1);
 
     const result = this.sql.exec(query, ...params);
-    return result.toArray() as unknown as MessageRow[];
+    return this.rows<MessageRow>(result);
   }
 
   // === EVENTS ===
@@ -570,6 +630,40 @@ export class SessionRepository {
       data.messageId,
       data.createdAt
     );
+  }
+
+  private upsertEventByMessageId<TType extends UpsertableEventType>(
+    type: TType,
+    messageId: string,
+    event: Extract<SandboxEvent, { type: TType }>,
+    createdAt: number
+  ): void {
+    const id = `${type}:${messageId}`;
+    this.sql.exec(
+      `INSERT INTO events (id, type, data, message_id, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         data = excluded.data,
+         message_id = excluded.message_id,
+         created_at = excluded.created_at`,
+      id,
+      type,
+      JSON.stringify(event),
+      messageId,
+      createdAt
+    );
+  }
+
+  upsertTokenEvent(messageId: string, event: TokenEvent, createdAt: number): void {
+    this.upsertEventByMessageId("token", messageId, event, createdAt);
+  }
+
+  upsertExecutionCompleteEvent(
+    messageId: string,
+    event: ExecutionCompleteEvent,
+    createdAt: number
+  ): void {
+    this.upsertEventByMessageId("execution_complete", messageId, event, createdAt);
   }
 
   listEvents(options: ListEventsOptions): EventRow[] {
@@ -595,7 +689,7 @@ export class SessionRepository {
     params.push(options.limit + 1);
 
     const result = this.sql.exec(query, ...params);
-    return result.toArray() as unknown as EventRow[];
+    return this.rows<EventRow>(result);
   }
 
   getEventsForReplay(limit: number): EventRow[] {
@@ -606,7 +700,7 @@ export class SessionRepository {
        ) sub ORDER BY created_at ASC, id ASC`,
       limit
     );
-    return result.toArray() as unknown as EventRow[];
+    return this.rows<EventRow>(result);
   }
 
   /**
@@ -621,16 +715,15 @@ export class SessionRepository {
     events: EventRow[];
     hasMore: boolean;
   } {
-    const rows = this.sql
-      .exec(
-        `SELECT * FROM events
+    const result = this.sql.exec(
+      `SELECT * FROM events
          WHERE type != 'heartbeat' AND ((created_at < ?1) OR (created_at = ?1 AND id < ?2))
          ORDER BY created_at DESC, id DESC LIMIT ?3`,
-        cursorTimestamp,
-        cursorId,
-        limit + 1
-      )
-      .toArray() as unknown as EventRow[];
+      cursorTimestamp,
+      cursorId,
+      limit + 1
+    );
+    const rows = this.rows<EventRow>(result);
 
     const hasMore = rows.length > limit;
     if (hasMore) rows.pop();
@@ -655,7 +748,7 @@ export class SessionRepository {
 
   listArtifacts(): ArtifactRow[] {
     const result = this.sql.exec(`SELECT * FROM artifacts ORDER BY created_at DESC`);
-    return result.toArray() as unknown as ArtifactRow[];
+    return this.rows<ArtifactRow>(result);
   }
 
   // === WS CLIENT MAPPING ===
@@ -673,13 +766,13 @@ export class SessionRepository {
 
   getWsClientMapping(wsId: string): WsClientMappingResult | null {
     const result = this.sql.exec(
-      `SELECT m.participant_id, m.client_id, p.user_id, p.github_name, p.github_login
+      `SELECT m.participant_id, m.client_id, p.user_id, p.scm_name, p.scm_login
        FROM ws_client_mapping m
        JOIN participants p ON m.participant_id = p.id
        WHERE m.ws_id = ?`,
       wsId
     );
-    const rows = result.toArray() as unknown as WsClientMappingResult[];
+    const rows = this.rows<WsClientMappingResult>(result);
     return rows[0] ?? null;
   }
 

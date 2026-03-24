@@ -7,73 +7,46 @@ import {
   MetadataSection,
   TasksSection,
   FilesChangedSection,
+  CodeServerSection,
 } from "./sidebar";
+import { ChildSessionsSection } from "./sidebar/child-sessions-section";
 import { extractLatestTasks } from "@/lib/tasks";
-import type { Artifact, FileChange } from "@/types/session";
-
-interface SessionState {
-  id: string;
-  title: string | null;
-  repoOwner: string;
-  repoName: string;
-  branchName: string | null;
-  status: string;
-  sandboxStatus: string;
-  messageCount: number;
-  createdAt: number;
-  model?: string;
-  reasoningEffort?: string;
-}
-
-interface Participant {
-  userId: string;
-  name: string;
-  avatar?: string;
-  status: "active" | "idle" | "away";
-  lastSeen: number;
-}
-
-interface SandboxEvent {
-  type: string;
-  tool?: string;
-  args?: Record<string, unknown>;
-  timestamp: number;
-}
+import { extractChangedFiles } from "@/lib/files";
+import type { Artifact, SandboxEvent } from "@/types/session";
+import type { ParticipantPresence, SessionState } from "@open-inspect/shared";
 
 interface SessionRightSidebarProps {
   sessionState: SessionState | null;
-  participants: Participant[];
+  participants: ParticipantPresence[];
   events: SandboxEvent[];
   artifacts: Artifact[];
-  filesChanged?: FileChange[];
 }
 
-export function SessionRightSidebar({
+export type SessionRightSidebarContentProps = SessionRightSidebarProps;
+
+export function SessionRightSidebarContent({
   sessionState,
   participants,
   events,
   artifacts,
-  filesChanged = [],
-}: SessionRightSidebarProps) {
-  // Extract latest tasks from TodoWrite events
+}: SessionRightSidebarContentProps) {
   const tasks = useMemo(() => extractLatestTasks(events), [events]);
+  const filesChanged = useMemo(() => extractChangedFiles(events), [events]);
 
   if (!sessionState) {
     return (
-      <aside className="w-80 border-l border-border-muted overflow-y-auto hidden lg:block">
-        <div className="p-4">
-          <div className="animate-pulse space-y-4">
-            <div className="h-4 bg-muted w-3/4" />
-            <div className="h-4 bg-muted w-1/2" />
-            <div className="h-4 bg-muted w-2/3" />
-          </div>
+      <div className="p-4">
+        <div className="animate-pulse space-y-4">
+          <div className="h-4 bg-muted w-3/4" />
+          <div className="h-4 bg-muted w-1/2" />
+          <div className="h-4 bg-muted w-2/3" />
         </div>
-      </aside>
+      </div>
     );
   }
 
   return (
-    <aside className="w-80 border-l border-border-muted overflow-y-auto hidden lg:block">
+    <>
       {/* Participants */}
       <div className="px-4 py-4 border-b border-border-muted">
         <ParticipantsSection participants={participants} />
@@ -85,12 +58,25 @@ export function SessionRightSidebar({
           createdAt={sessionState.createdAt}
           model={sessionState.model}
           reasoningEffort={sessionState.reasoningEffort}
+          baseBranch={sessionState.baseBranch}
           branchName={sessionState.branchName || undefined}
           repoOwner={sessionState.repoOwner}
           repoName={sessionState.repoName}
           artifacts={artifacts}
+          parentSessionId={sessionState.parentSessionId}
         />
       </div>
+
+      {/* Code Server */}
+      {sessionState.codeServerUrl && (
+        <div className="px-4 py-4 border-b border-border-muted">
+          <CodeServerSection
+            url={sessionState.codeServerUrl}
+            password={sessionState.codeServerPassword ?? null}
+            sandboxStatus={sessionState.sandboxStatus}
+          />
+        </div>
+      )}
 
       {/* Tasks */}
       {tasks.length > 0 && (
@@ -98,6 +84,9 @@ export function SessionRightSidebar({
           <TasksSection tasks={tasks} />
         </CollapsibleSection>
       )}
+
+      {/* Child Sessions */}
+      <ChildSessionsSection sessionId={sessionState.id} />
 
       {/* Files Changed */}
       {filesChanged.length > 0 && (
@@ -114,6 +103,24 @@ export function SessionRightSidebar({
           </p>
         </div>
       )}
+    </>
+  );
+}
+
+export function SessionRightSidebar({
+  sessionState,
+  participants,
+  events,
+  artifacts,
+}: SessionRightSidebarProps) {
+  return (
+    <aside className="w-80 border-l border-border-muted overflow-y-auto hidden lg:block">
+      <SessionRightSidebarContent
+        sessionState={sessionState}
+        participants={participants}
+        events={events}
+        artifacts={artifacts}
+      />
     </aside>
   );
 }

@@ -1,5 +1,17 @@
 "use client";
 
+import { useIsMobile } from "@/hooks/use-media-query";
+import {
+  KeyIcon,
+  ModelIcon,
+  BoxIcon,
+  KeyboardIcon,
+  DataControlsIcon,
+  IntegrationsIcon,
+  AppearanceIcon,
+  ChevronRightIcon,
+} from "@/components/ui/icons";
+
 const NAV_ITEMS = [
   {
     id: "secrets",
@@ -7,9 +19,34 @@ const NAV_ITEMS = [
     icon: KeyIcon,
   },
   {
+    id: "models",
+    label: "Models",
+    icon: ModelIcon,
+  },
+  {
+    id: "images",
+    label: "Images",
+    icon: BoxIcon,
+  },
+  {
+    id: "appearance",
+    label: "Appearance",
+    icon: AppearanceIcon,
+  },
+  {
+    id: "keyboard-shortcuts",
+    label: "Keyboard",
+    icon: KeyboardIcon,
+  },
+  {
     id: "data-controls",
     label: "Data Controls",
     icon: DataControlsIcon,
+  },
+  {
+    id: "integrations",
+    label: "Integrations",
+    icon: IntegrationsIcon,
   },
 ] as const;
 
@@ -18,9 +55,40 @@ export type SettingsCategory = (typeof NAV_ITEMS)[number]["id"];
 interface SettingsNavProps {
   activeCategory: SettingsCategory;
   onSelect: (category: SettingsCategory) => void;
+  onNavigate?: () => void;
 }
 
-export function SettingsNav({ activeCategory, onSelect }: SettingsNavProps) {
+export function SettingsNav({ activeCategory, onSelect, onNavigate }: SettingsNavProps) {
+  const isMobile = useIsMobile();
+
+  if (isMobile) {
+    return (
+      <nav className="p-4">
+        <h2 className="text-lg font-semibold text-foreground mb-4">Settings</h2>
+        <ul className="space-y-1">
+          {NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            return (
+              <li key={item.id}>
+                <button
+                  onClick={() => {
+                    onSelect(item.id);
+                    onNavigate?.();
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-3 text-sm rounded transition text-foreground hover:bg-muted"
+                >
+                  <Icon className="w-4 h-4" />
+                  <span className="flex-1 text-left">{item.label}</span>
+                  <ChevronRightIcon className="w-4 h-4 text-muted-foreground" />
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </nav>
+    );
+  }
+
   return (
     <nav className="w-48 flex-shrink-0 border-r border-border-muted p-4">
       <h2 className="text-lg font-semibold text-foreground mb-4">Settings</h2>
@@ -38,7 +106,7 @@ export function SettingsNav({ activeCategory, onSelect }: SettingsNavProps) {
                     : "text-muted-foreground hover:text-foreground hover:bg-muted"
                 }`}
               >
-                <Icon />
+                <Icon className="w-4 h-4" />
                 {item.label}
               </button>
             </li>
@@ -46,39 +114,5 @@ export function SettingsNav({ activeCategory, onSelect }: SettingsNavProps) {
         })}
       </ul>
     </nav>
-  );
-}
-
-function DataControlsIcon() {
-  return (
-    <svg
-      className="w-4 h-4"
-      fill="none"
-      stroke="currentColor"
-      viewBox="0 0 24 24"
-      strokeWidth={2}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <ellipse cx="12" cy="5" rx="9" ry="3" />
-      <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
-      <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
-    </svg>
-  );
-}
-
-function KeyIcon() {
-  return (
-    <svg
-      className="w-4 h-4"
-      fill="none"
-      stroke="currentColor"
-      viewBox="0 0 24 24"
-      strokeWidth={2}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
-    </svg>
   );
 }

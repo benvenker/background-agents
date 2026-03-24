@@ -4,6 +4,10 @@ import { getServerSession } from "next-auth";
 import { getToken } from "next-auth/jwt";
 import { authOptions } from "@/lib/auth";
 import { controlPlaneFetch } from "@/lib/control-plane";
+import {
+  buildControlPlanePath,
+  SESSION_CONTROL_PLANE_QUERY_PARAMS,
+} from "@/lib/control-plane-query";
 
 export async function GET(request: NextRequest) {
   const routeStart = Date.now();
@@ -15,9 +19,11 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const searchParams = request.nextUrl.searchParams;
-  const queryString = searchParams.toString();
-  const path = queryString ? `/sessions?${queryString}` : "/sessions";
+  const path = buildControlPlanePath(
+    "/sessions",
+    request.nextUrl.searchParams,
+    SESSION_CONTROL_PLANE_QUERY_PARAMS
+  );
 
   try {
     const fetchStart = Date.now();
@@ -47,7 +53,7 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
 
     const jwt = await getToken({ req: request });
-    const githubToken = jwt?.accessToken as string | undefined;
+    const accessToken = jwt?.accessToken as string | undefined;
 
     // Explicitly pick allowed fields from client body and derive identity
     // from the server-side NextAuth session (not client-supplied data)
@@ -59,12 +65,16 @@ export async function POST(request: NextRequest) {
       repoName: body.repoName,
       model: body.model,
       reasoningEffort: body.reasoningEffort,
+      branch: body.branch,
       title: body.title,
-      githubToken,
+      scmToken: accessToken,
+      scmRefreshToken: jwt?.refreshToken as string | undefined,
+      scmTokenExpiresAt: jwt?.accessTokenExpiresAt as number | undefined,
+      scmUserId: user.id,
       userId,
-      githubLogin: user.login,
-      githubName: user.name,
-      githubEmail: user.email,
+      scmLogin: user.login,
+      scmName: user.name,
+      scmEmail: user.email,
     };
 
     const response = await controlPlaneFetch("/sessions", {

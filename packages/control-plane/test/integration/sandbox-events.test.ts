@@ -142,6 +142,9 @@ describe("POST /internal/sandbox-event", () => {
     );
     expect(messages[0].status).toBe("completed");
     expect(messages[0].completed_at).toEqual(expect.any(Number));
+
+    const sessions = await queryDO<{ status: string }>(stub, "SELECT status FROM session LIMIT 1");
+    expect(sessions[0].status).toBe("completed");
   });
 
   it("execution_complete with success=false marks message as failed", async () => {
@@ -183,6 +186,57 @@ describe("POST /internal/sandbox-event", () => {
       msgId
     );
     expect(messages[0].status).toBe("failed");
+
+    const sessions = await queryDO<{ status: string }>(stub, "SELECT status FROM session LIMIT 1");
+    expect(sessions[0].status).toBe("failed");
+  });
+
+  it("execution_complete keeps session active when queued messages remain", async () => {
+    const { stub } = await initSession();
+
+    const participants = await queryDO<{ id: string }>(
+      stub,
+      "SELECT id FROM participants WHERE user_id = 'user-1'"
+    );
+    const participantId = participants[0].id;
+
+    const processingMsgId = "msg-processing";
+    await seedMessage(stub, {
+      id: processingMsgId,
+      authorId: participantId,
+      content: "First prompt",
+      source: "web",
+      status: "processing",
+      createdAt: Date.now() - 2000,
+      startedAt: Date.now() - 1000,
+    });
+
+    const queuedMsgId = "msg-queued";
+    await seedMessage(stub, {
+      id: queuedMsgId,
+      authorId: participantId,
+      content: "Second prompt",
+      source: "web",
+      status: "pending",
+      createdAt: Date.now() - 500,
+    });
+
+    const res = await stub.fetch("http://internal/internal/sandbox-event", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "execution_complete",
+        messageId: processingMsgId,
+        success: true,
+        sandboxId: "sb-1",
+        timestamp: Date.now() / 1000,
+      }),
+    });
+
+    expect(res.status).toBe(200);
+
+    const sessions = await queryDO<{ status: string }>(stub, "SELECT status FROM session LIMIT 1");
+    expect(sessions[0].status).toBe("active");
   });
 
   it("git_sync updates sandbox and session", async () => {
@@ -212,11 +266,11 @@ describe("POST /internal/sandbox-event", () => {
     expect(session[0].current_sha).toBe("abc123def456");
   });
 
-  it("multiple events maintain order via events endpoint", async () => {
+  it("multiple token events upsert to latest persisted event", async () => {
     const { stub } = await initSession();
     const now = Date.now() / 1000;
 
-    // Send 3 events sequentially
+    // Send 3 token events for the same message
     for (let i = 0; i < 3; i++) {
       await stub.fetch("http://internal/internal/sandbox-event", {
         method: "POST",
@@ -231,16 +285,22 @@ describe("POST /internal/sandbox-event", () => {
       });
     }
 
-    const eventsRes = await stub.fetch("http://internal/internal/events?type=token");
+    const eventsRes = await stub.fetch(
+      "http://internal/internal/events?type=token&message_id=msg-order"
+    );
     const { events } = await eventsRes.json<{
-      events: Array<{ type: string; data: { content: string }; createdAt: number }>;
+      events: Array<{
+        id: string;
+        type: string;
+        data: { content: string };
+        messageId: string;
+        createdAt: number;
+      }>;
     }>();
 
-    // Events endpoint returns DESC order; filter to our specific events
-    const tokenEvents = events.filter((e) => {
-      const content = e.data.content;
-      return content === "token-0" || content === "token-1" || content === "token-2";
-    });
-    expect(tokenEvents.length).toBeGreaterThanOrEqual(3);
+    expect(events).toHaveLength(1);
+    expect(events[0].id).toBe("token:msg-order");
+    expect(events[0].messageId).toBe("msg-order");
+    expect(events[0].data.content).toBe("token-2");
   });
 });

@@ -20,19 +20,21 @@ variable "cloudflare_zone_id" {
 }
 
 variable "cloudflare_worker_subdomain" {
-  description = "Cloudflare Workers subdomain (account-specific, found in Workers dashboard)"
+  description = "Cloudflare Workers account subdomain (e.g. 'myaccount' — .workers.dev is appended automatically)"
   type        = string
 }
 
 variable "vercel_api_token" {
-  description = "Vercel API token"
+  description = "Vercel API token (required only when web_platform = 'vercel')"
   type        = string
   sensitive   = true
+  default     = "unused"
 }
 
 variable "vercel_team_id" {
-  description = "Vercel team ID"
+  description = "Vercel team ID (required only when web_platform = 'vercel')"
   type        = string
+  default     = "unused"
 }
 
 variable "modal_token_id" {
@@ -88,18 +90,105 @@ variable "github_app_installation_id" {
 }
 
 # =============================================================================
+# GitHub Bot Configuration
+# =============================================================================
+
+variable "enable_github_bot" {
+  description = "Enable the GitHub bot worker. Requires github_webhook_secret and github_bot_username."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = var.enable_github_bot == false || (length(var.github_webhook_secret) > 0 && length(var.github_bot_username) > 0)
+    error_message = "When enable_github_bot is true, github_webhook_secret and github_bot_username must be non-empty."
+  }
+}
+
+variable "github_webhook_secret" {
+  description = "Shared secret for verifying GitHub webhook signatures (generate with: openssl rand -hex 32)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "github_bot_username" {
+  description = "GitHub App bot username for @mention detection (e.g., 'my-app[bot]')"
+  type        = string
+  default     = ""
+}
+
+# =============================================================================
 # Slack App Credentials
 # =============================================================================
+
+variable "enable_slack_bot" {
+  description = "Enable the Slack bot worker. Set to false to skip deployment."
+  type        = bool
+  default     = true
+
+  validation {
+    condition     = var.enable_slack_bot == false || (length(var.slack_bot_token) > 0 && length(var.slack_signing_secret) > 0)
+    error_message = "When enable_slack_bot is true, slack_bot_token and slack_signing_secret must be non-empty."
+  }
+}
 
 variable "slack_bot_token" {
   description = "Slack Bot OAuth token (xoxb-...)"
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "slack_signing_secret" {
   description = "Slack app signing secret"
   type        = string
+  sensitive   = true
+  default     = ""
+}
+
+# =============================================================================
+# Linear Agent Credentials
+# =============================================================================
+
+variable "enable_linear_bot" {
+  description = "Enable the Linear bot worker. Requires linear_client_id, linear_client_secret, and linear_webhook_secret."
+  type        = bool
+  default     = false
+
+  validation {
+    condition = var.enable_linear_bot == false || (
+      length(var.linear_client_id) > 0 &&
+      length(var.linear_client_secret) > 0 &&
+      length(var.linear_webhook_secret) > 0
+    )
+    error_message = "When enable_linear_bot is true, linear_client_id, linear_client_secret, and linear_webhook_secret must be non-empty."
+  }
+}
+
+variable "linear_client_id" {
+  description = "Linear OAuth Application Client ID (from Settings → API → Applications)"
+  type        = string
+  default     = ""
+}
+
+variable "linear_client_secret" {
+  description = "Linear OAuth Application Client Secret"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "linear_webhook_secret" {
+  description = "Linear webhook signing secret (from the OAuth Application config)"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "linear_api_key" {
+  description = "Linear API key for fallback comment posting"
+  type        = string
+  default     = ""
   sensitive   = true
 }
 
@@ -150,6 +239,17 @@ variable "nextauth_secret" {
 # =============================================================================
 # Configuration
 # =============================================================================
+
+variable "web_platform" {
+  description = "Platform for the web app deployment: 'vercel' or 'cloudflare' (OpenNext)"
+  type        = string
+  default     = "vercel"
+
+  validation {
+    condition     = contains(["vercel", "cloudflare"], var.web_platform)
+    error_message = "web_platform must be 'vercel' or 'cloudflare'."
+  }
+}
 
 variable "deployment_name" {
   description = "Unique deployment name used in URLs and resource names. Use something unique like your GitHub username or company name (e.g., 'acme', 'johndoe'). This will create URLs like: open-inspect-{deployment_name}.vercel.app"

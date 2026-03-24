@@ -3,15 +3,18 @@
  */
 
 import type {
+  Attachment,
   SessionStatus,
   SandboxStatus,
   GitSyncStatus,
   MessageStatus,
   MessageSource,
   ParticipantRole,
+  SpawnSource,
   ArtifactType,
   EventType,
 } from "../types";
+import type { GitPushSpec } from "../source-control";
 
 // Database row types (match SQLite schema)
 
@@ -22,7 +25,7 @@ export interface SessionRow {
   repo_owner: string;
   repo_name: string;
   repo_id: number | null;
-  repo_default_branch: string;
+  base_branch: string;
   branch_name: string | null;
   base_sha: string | null;
   current_sha: string | null;
@@ -30,6 +33,10 @@ export interface SessionRow {
   model: string; // LLM model to use (e.g., "anthropic/claude-haiku-4-5")
   reasoning_effort: string | null; // Reasoning effort level (e.g., "high", "max")
   status: SessionStatus;
+  parent_session_id: string | null;
+  spawn_source: SpawnSource;
+  spawn_depth: number;
+  code_server_enabled: number; // 0 = disabled (default), 1 = enabled
   created_at: number;
   updated_at: number;
 }
@@ -37,14 +44,14 @@ export interface SessionRow {
 export interface ParticipantRow {
   id: string;
   user_id: string;
-  github_user_id: string | null;
-  github_login: string | null;
-  github_email: string | null;
-  github_name: string | null;
+  scm_user_id: string | null;
+  scm_login: string | null;
+  scm_email: string | null;
+  scm_name: string | null;
   role: ParticipantRole;
-  github_access_token_encrypted: string | null;
-  github_refresh_token_encrypted: string | null;
-  github_token_expires_at: number | null;
+  scm_access_token_encrypted: string | null;
+  scm_refresh_token_encrypted: string | null;
+  scm_token_expires_at: number | null;
   ws_auth_token: string | null; // SHA-256 hash of WebSocket auth token
   ws_token_created_at: number | null; // When the token was generated
   joined_at: number;
@@ -89,12 +96,15 @@ export interface SandboxRow {
   snapshot_id: string | null;
   snapshot_image_id: string | null; // Modal Image ID for filesystem snapshot restoration
   auth_token: string | null;
+  auth_token_hash: string | null; // SHA-256 hash of sandbox auth token
   status: SandboxStatus;
   git_sync_status: GitSyncStatus;
   last_heartbeat: number | null;
   last_activity: number | null; // Last activity timestamp for inactivity-based snapshot
   last_spawn_error: string | null;
   last_spawn_error_at: number | null;
+  code_server_url: string | null;
+  code_server_password: string | null;
   created_at: number;
 }
 
@@ -108,15 +118,10 @@ export interface PromptCommand {
   reasoningEffort?: string; // Reasoning effort level
   author: {
     userId: string;
-    githubName: string | null;
-    githubEmail: string | null;
+    scmName: string | null;
+    scmEmail: string | null;
   };
-  attachments?: Array<{
-    type: string;
-    name: string;
-    url?: string;
-    content?: string;
-  }>;
+  attachments?: Attachment[];
 }
 
 export interface StopCommand {
@@ -131,7 +136,23 @@ export interface ShutdownCommand {
   type: "shutdown";
 }
 
-export type SandboxCommand = PromptCommand | StopCommand | SnapshotCommand | ShutdownCommand;
+export interface AckCommand {
+  type: "ack";
+  ackId: string;
+}
+
+export interface PushCommand {
+  type: "push";
+  pushSpec: GitPushSpec;
+}
+
+export type SandboxCommand =
+  | PromptCommand
+  | StopCommand
+  | SnapshotCommand
+  | ShutdownCommand
+  | AckCommand
+  | PushCommand;
 
 // Internal session update types
 

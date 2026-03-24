@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { env } from "cloudflare:test";
 import { initNamedSession, openClientWs, collectMessages, seedEvents, queryDO } from "./helpers";
 
 describe("Client WebSocket (via SELF.fetch)", () => {
@@ -20,10 +21,11 @@ describe("Client WebSocket (via SELF.fetch)", () => {
 
     const subscribed = messages!.find((m) => m.type === "subscribed") as Record<string, unknown>;
     expect(subscribed).toBeDefined();
-    expect(subscribed.sessionId).toEqual(expect.any(String));
+    expect(subscribed.sessionId).toBe(name);
     expect(subscribed.participantId).toBe(participantId);
 
     const state = subscribed.state as Record<string, unknown>;
+    expect(state.id).toBe(name);
     expect(state.repoOwner).toBe("acme");
 
     ws.close();
@@ -73,24 +75,67 @@ describe("Client WebSocket (via SELF.fetch)", () => {
     expect(code).toBe(4001);
   });
 
-  it("subscribe sends replay_complete with hasMore=false for empty session", async () => {
+  it("subscribe with expired token closes socket 4001", async () => {
+    const name = `ws-client-expired-${Date.now()}`;
+    const { stub } = await initNamedSession(name);
+
+    // Generate a valid WS token
+    const id = env.SESSION.idFromName(name);
+    const doStub = env.SESSION.get(id);
+    const tokenRes = await doStub.fetch("http://internal/internal/ws-token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId: "user-1" }),
+    });
+    const { token } = await tokenRes.json<{ token: string }>();
+
+    // Back-date the token past the 24-hour TTL
+    const expiredAt = Date.now() - 24 * 60 * 60 * 1000 - 1;
+    await queryDO(
+      stub,
+      "UPDATE participants SET ws_token_created_at = ? WHERE user_id = ?",
+      expiredAt,
+      "user-1"
+    );
+
+    // Open WS and try to subscribe with the expired token
+    const { ws } = await openClientWs(name);
+
+    const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+      ws.addEventListener("close", (evt) => resolve({ code: evt.code, reason: evt.reason }));
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: "subscribe",
+        token,
+        clientId: "test-client",
+      })
+    );
+
+    const { code, reason } = await closed;
+    expect(code).toBe(4001);
+    expect(reason).toBe("Token expired");
+  });
+
+  it("subscribe includes batched replay with hasMore=false for empty session", async () => {
     const name = `ws-client-replay-empty-${Date.now()}`;
     await initNamedSession(name);
 
     const { ws, messages } = await openClientWs(name, { subscribe: true });
 
-    const replayComplete = messages!.find((m) => m.type === "replay_complete") as Record<
-      string,
-      unknown
-    >;
-    expect(replayComplete).toBeDefined();
-    expect(replayComplete.hasMore).toBe(false);
-    expect(replayComplete.cursor).toBeNull();
+    const subscribed = messages!.find((m) => m.type === "subscribed") as Record<string, unknown>;
+    expect(subscribed).toBeDefined();
+    const replay = subscribed.replay as { events: unknown[]; hasMore: boolean; cursor: unknown };
+    expect(replay).toBeDefined();
+    expect(replay.hasMore).toBe(false);
+    expect(replay.cursor).toBeNull();
+    expect(replay.events).toHaveLength(0);
 
     ws.close();
   });
 
-  it("subscribe replays historical events before replay_complete", async () => {
+  it("subscribe includes historical events in batched replay", async () => {
     const name = `ws-client-replay-events-${Date.now()}`;
     const { stub } = await initNamedSession(name);
 
@@ -112,13 +157,13 @@ describe("Client WebSocket (via SELF.fetch)", () => {
 
     const { ws, messages } = await openClientWs(name, { subscribe: true });
 
-    const types = messages!.map((m) => m.type);
-    const replayIdx = types.indexOf("replay_complete");
-    expect(replayIdx).toBeGreaterThan(0);
-
-    // sandbox_event messages should appear before replay_complete
-    const sandboxEvents = messages!.filter((m, i) => m.type === "sandbox_event" && i < replayIdx);
-    expect(sandboxEvents.length).toBe(2);
+    const subscribed = messages!.find((m) => m.type === "subscribed") as Record<string, unknown>;
+    expect(subscribed).toBeDefined();
+    const replay = subscribed.replay as { events: Record<string, unknown>[]; hasMore: boolean };
+    expect(replay).toBeDefined();
+    expect(replay.events).toHaveLength(2);
+    expect(replay.events[0].type).toBe("tool_call");
+    expect(replay.events[1].type).toBe("tool_result");
 
     ws.close();
   });

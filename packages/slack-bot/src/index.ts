@@ -16,6 +16,7 @@ import {
   getThreadMessages,
   publishView,
 } from "./utils/slack-client";
+import { resolveUserNames } from "./utils/resolve-users";
 import { createClassifier } from "./classifier";
 import { getAvailableRepos } from "./classifier/repos";
 import { callbacksRouter } from "./callbacks";
@@ -24,6 +25,7 @@ import { createLogger } from "./logger";
 import {
   MODEL_OPTIONS,
   DEFAULT_MODEL,
+  DEFAULT_ENABLED_MODELS,
   isValidModel,
   getValidModelOrDefault,
   getReasoningConfig,
@@ -254,12 +256,41 @@ async function clearThreadSession(env: Env, channel: string, threadTs: string): 
 /**
  * Derive flat model options from shared MODEL_OPTIONS for Slack dropdowns.
  */
-const AVAILABLE_MODELS = MODEL_OPTIONS.flatMap((group) =>
+const ALL_MODELS = MODEL_OPTIONS.flatMap((group) =>
   group.models.map((m) => ({
     label: `${m.name} (${m.description})`,
     value: m.id,
   }))
 );
+
+/**
+ * Fetch enabled models from the control plane, falling back to defaults.
+ */
+async function getAvailableModels(
+  env: Env,
+  traceId?: string
+): Promise<{ label: string; value: string }[]> {
+  try {
+    const headers = await getAuthHeaders(env, traceId);
+    const response = await env.CONTROL_PLANE.fetch("https://internal/model-preferences", {
+      method: "GET",
+      headers,
+    });
+
+    if (response.ok) {
+      const data = (await response.json()) as { enabledModels: string[] };
+      if (data.enabledModels.length > 0) {
+        const enabledSet = new Set(data.enabledModels);
+        return ALL_MODELS.filter((m) => enabledSet.has(m.value));
+      }
+    }
+  } catch {
+    // Fall through to defaults
+  }
+
+  const defaultSet = new Set<string>(DEFAULT_ENABLED_MODELS);
+  return ALL_MODELS.filter((m) => defaultSet.has(m.value));
+}
 
 /**
  * Generate a consistent KV key for user preferences.
@@ -343,8 +374,9 @@ async function publishAppHome(env: Env, userId: string): Promise<void> {
   const fallback = env.DEFAULT_MODEL || DEFAULT_MODEL;
   // Normalize model to ensure it's valid - UI and behavior will be consistent
   const currentModel = getValidModelOrDefault(prefs?.model ?? fallback);
+  const availableModels = await getAvailableModels(env);
   const currentModelInfo =
-    AVAILABLE_MODELS.find((m) => m.value === currentModel) || AVAILABLE_MODELS[0];
+    availableModels.find((m) => m.value === currentModel) || availableModels[0];
 
   // Determine reasoning effort options for the current model
   const reasoningConfig = getReasoningConfig(currentModel);
@@ -391,7 +423,7 @@ async function publishAppHome(env: Env, userId: string): Promise<void> {
             text: { type: "plain_text", text: currentModelInfo.label },
             value: currentModelInfo.value,
           },
-          options: AVAILABLE_MODELS.map((m) => ({
+          options: availableModels.map((m) => ({
             text: { type: "plain_text", text: m.label },
             value: m.value,
           })),
@@ -552,6 +584,7 @@ async function startSessionAndSendPrompt(
 
   // Build callback context for follow-up notification
   const callbackContext: CallbackContext = {
+    source: "slack",
     channel,
     threadTs,
     repoFullName: repo.fullName,
@@ -819,9 +852,16 @@ async function handleAppMention(
     try {
       const threadResult = await getThreadMessages(env.SLACK_BOT_TOKEN, channel, thread_ts, 10);
       if (threadResult.ok && threadResult.messages) {
-        previousMessages = threadResult.messages
-          .filter((m) => m.ts !== ts) // Exclude current message, but include bot messages
-          .map((m) => (m.bot_id ? `[Bot]: ${m.text}` : `[User]: ${m.text}`))
+        const filtered = threadResult.messages.filter((m) => m.ts !== ts);
+        // Resolve unique user IDs to display names for attribution
+        const uniqueUserIds = [...new Set(filtered.map((m) => m.user).filter(Boolean))] as string[];
+        const userNames = await resolveUserNames(env.SLACK_BOT_TOKEN, uniqueUserIds);
+        previousMessages = filtered
+          .map((m) => {
+            if (m.bot_id) return `[Bot]: ${m.text}`;
+            const name = m.user ? userNames.get(m.user) || m.user : "Unknown";
+            return `[${name}]: ${m.text}`;
+          })
           .slice(-10);
       }
     } catch {
@@ -847,6 +887,7 @@ async function handleAppMention(
     const existingSession = await lookupThreadSession(env, channel, thread_ts);
     if (existingSession) {
       const callbackContext: CallbackContext = {
+        source: "slack",
         channel,
         threadTs: thread_ts,
         repoFullName: existingSession.repoFullName,

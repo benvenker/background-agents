@@ -1,3 +1,5 @@
+import type { SandboxEvent as SharedSandboxEvent } from "@open-inspect/shared";
+
 // Session-related type definitions
 
 export interface Artifact {
@@ -7,11 +9,18 @@ export interface Artifact {
   metadata?: {
     prNumber?: number;
     prState?: "open" | "merged" | "closed" | "draft";
+    mode?: "manual_pr";
+    createPrUrl?: string;
+    head?: string;
+    base?: string;
+    provider?: string;
     filename?: string;
     previewStatus?: "active" | "outdated" | "stopped";
   };
   createdAt: number;
 }
+
+export type SandboxEvent = SharedSandboxEvent;
 
 export interface Task {
   content: string;
@@ -23,21 +32,4 @@ export interface FileChange {
   filename: string;
   additions: number;
   deletions: number;
-}
-
-export interface ChildSession {
-  id: string;
-  description: string;
-  prNumber?: number;
-  prState?: "open" | "merged" | "closed" | "draft";
-  platform?: string;
-}
-
-export interface SessionMetadata {
-  title: string;
-  model?: string;
-  branchName?: string;
-  projectTag?: string;
-  createdAt: number;
-  updatedAt?: number;
 }

@@ -12,10 +12,17 @@
 export const VALID_MODELS = [
   "anthropic/claude-haiku-4-5",
   "anthropic/claude-sonnet-4-5",
+  "anthropic/claude-sonnet-4-6",
   "anthropic/claude-opus-4-5",
+  "anthropic/claude-opus-4-6",
   "openai/gpt-5.2",
+  "openai/gpt-5.4",
   "openai/gpt-5.2-codex",
   "openai/gpt-5.3-codex",
+  "openai/gpt-5.3-codex-spark",
+  "opencode/kimi-k2.5",
+  "opencode/minimax-m2.5",
+  "opencode/glm-5",
 ] as const;
 
 export type ValidModel = (typeof VALID_MODELS)[number];
@@ -23,7 +30,7 @@ export type ValidModel = (typeof VALID_MODELS)[number];
 /**
  * Default model to use when none specified or invalid.
  */
-export const DEFAULT_MODEL: ValidModel = "anthropic/claude-haiku-4-5";
+export const DEFAULT_MODEL: ValidModel = "anthropic/claude-sonnet-4-6";
 
 /**
  * Reasoning effort levels supported across providers.
@@ -46,10 +53,14 @@ export interface ModelReasoningConfig {
 export const MODEL_REASONING_CONFIG: Partial<Record<ValidModel, ModelReasoningConfig>> = {
   "anthropic/claude-haiku-4-5": { efforts: ["high", "max"], default: "max" },
   "anthropic/claude-sonnet-4-5": { efforts: ["high", "max"], default: "max" },
+  "anthropic/claude-sonnet-4-6": { efforts: ["low", "medium", "high", "max"], default: "high" },
   "anthropic/claude-opus-4-5": { efforts: ["high", "max"], default: "max" },
+  "anthropic/claude-opus-4-6": { efforts: ["low", "medium", "high", "max"], default: "high" },
   "openai/gpt-5.2": { efforts: ["none", "low", "medium", "high", "xhigh"], default: undefined },
+  "openai/gpt-5.4": { efforts: ["none", "low", "medium", "high", "xhigh"], default: undefined },
   "openai/gpt-5.2-codex": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
   "openai/gpt-5.3-codex": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
+  "openai/gpt-5.3-codex-spark": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
 };
 
 export interface ModelDisplayInfo {
@@ -81,9 +92,19 @@ export const MODEL_OPTIONS: ModelCategory[] = [
         description: "Balanced performance",
       },
       {
+        id: "anthropic/claude-sonnet-4-6",
+        name: "Claude Sonnet 4.6",
+        description: "Latest balanced, fast coding",
+      },
+      {
         id: "anthropic/claude-opus-4-5",
         name: "Claude Opus 4.5",
         description: "Most capable",
+      },
+      {
+        id: "anthropic/claude-opus-4-6",
+        name: "Claude Opus 4.6",
+        description: "Latest, most capable",
       },
     ],
   },
@@ -91,10 +112,41 @@ export const MODEL_OPTIONS: ModelCategory[] = [
     category: "OpenAI",
     models: [
       { id: "openai/gpt-5.2", name: "GPT 5.2", description: "400K context, fast" },
+      { id: "openai/gpt-5.4", name: "GPT 5.4", description: "Latest flagship model" },
       { id: "openai/gpt-5.2-codex", name: "GPT 5.2 Codex", description: "Optimized for code" },
       { id: "openai/gpt-5.3-codex", name: "GPT 5.3 Codex", description: "Latest codex" },
+      {
+        id: "openai/gpt-5.3-codex-spark",
+        name: "GPT 5.3 Codex Spark",
+        description: "Low-latency codex variant",
+      },
     ],
   },
+  {
+    category: "OpenCode Zen",
+    models: [
+      { id: "opencode/kimi-k2.5", name: "Kimi K2.5", description: "Moonshot AI" },
+      { id: "opencode/minimax-m2.5", name: "MiniMax M2.5", description: "MiniMax" },
+      { id: "opencode/glm-5", name: "GLM 5", description: "Z.ai 744B MoE" },
+    ],
+  },
+];
+
+/**
+ * Models enabled by default when no preferences are stored.
+ * Excludes zen models which must be opted into via settings.
+ */
+export const DEFAULT_ENABLED_MODELS: ValidModel[] = [
+  "anthropic/claude-haiku-4-5",
+  "anthropic/claude-sonnet-4-5",
+  "anthropic/claude-sonnet-4-6",
+  "anthropic/claude-opus-4-5",
+  "anthropic/claude-opus-4-6",
+  "openai/gpt-5.2",
+  "openai/gpt-5.4",
+  "openai/gpt-5.2-codex",
+  "openai/gpt-5.3-codex",
+  "openai/gpt-5.3-codex-spark",
 ];
 
 // === Normalization ===

@@ -2,14 +2,9 @@
  * Task extraction utilities for parsing TodoWrite events
  */
 
-import type { Task } from "@/types/session";
+import type { SandboxEvent, Task } from "@/types/session";
 
-interface SandboxEvent {
-  type: string;
-  tool?: string;
-  args?: Record<string, unknown>;
-  timestamp: number;
-}
+type ToolCallEvent = Extract<SandboxEvent, { type: "tool_call" }>;
 
 interface TodoWriteArgs {
   todos?: Array<{
@@ -25,8 +20,12 @@ interface TodoWriteArgs {
  */
 export function extractLatestTasks(events: SandboxEvent[]): Task[] {
   // Find all TodoWrite events, get the latest one
+  // Use case-insensitive comparison — OpenCode may report tool names in lowercase
   const todoWriteEvents = events
-    .filter((event) => event.type === "tool_call" && event.tool === "TodoWrite")
+    .filter(
+      (event): event is ToolCallEvent =>
+        event.type === "tool_call" && event.tool?.toLowerCase() === "todowrite"
+    )
     .sort((a, b) => b.timestamp - a.timestamp);
 
   if (todoWriteEvents.length === 0) {
@@ -45,28 +44,4 @@ export function extractLatestTasks(events: SandboxEvent[]): Task[] {
     status: todo.status || "pending",
     activeForm: todo.activeForm,
   }));
-}
-
-/**
- * Get task counts by status
- */
-export function getTaskCounts(tasks: Task[]): {
-  total: number;
-  pending: number;
-  inProgress: number;
-  completed: number;
-} {
-  return {
-    total: tasks.length,
-    pending: tasks.filter((t) => t.status === "pending").length,
-    inProgress: tasks.filter((t) => t.status === "in_progress").length,
-    completed: tasks.filter((t) => t.status === "completed").length,
-  };
-}
-
-/**
- * Get the currently active task (in_progress status)
- */
-export function getCurrentTask(tasks: Task[]): Task | null {
-  return tasks.find((t) => t.status === "in_progress") || null;
 }

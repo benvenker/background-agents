@@ -5,10 +5,12 @@
  * wrapping existing GitHub API functions.
  */
 
+import type { InstallationRepository } from "@open-inspect/shared";
 import type {
   SourceControlProvider,
   SourceControlAuthContext,
   GetRepositoryConfig,
+  RepositoryAccessResult,
   RepositoryInfo,
   CreatePullRequestConfig,
   CreatePullRequestResult,
@@ -18,9 +20,23 @@ import type {
   GitPushAuthContext,
 } from "../types";
 import { SourceControlProviderError } from "../errors";
-import { generateInstallationToken, fetchWithTimeout } from "../../auth/github-app";
+import {
+  getCachedInstallationToken,
+  getInstallationRepository,
+  listInstallationRepositories,
+  listRepositoryBranches,
+  fetchWithTimeout,
+} from "../../auth/github-app";
 import type { GitHubProviderConfig } from "./types";
 import { USER_AGENT, GITHUB_API_BASE } from "./constants";
+
+/** Extract HTTP status from upstream errors (GitHubHttpError has a .status property). */
+function extractHttpStatus(error: unknown): number | undefined {
+  if (error && typeof error === "object" && "status" in error && typeof error.status === "number") {
+    return error.status;
+  }
+  return undefined;
+}
 
 /**
  * GitHub implementation of SourceControlProvider.
@@ -29,9 +45,11 @@ export class GitHubSourceControlProvider implements SourceControlProvider {
   readonly name = "github";
 
   private readonly appConfig?: GitHubProviderConfig["appConfig"];
+  private readonly kvCache?: KVNamespace;
 
   constructor(config: GitHubProviderConfig = {}) {
     this.appConfig = config.appConfig;
+    this.kvCache = config.kvCache;
   }
 
   /**
@@ -183,6 +201,95 @@ export class GitHubSourceControlProvider implements SourceControlProvider {
   }
 
   /**
+   * Check whether a repository is accessible to the GitHub App installation.
+   */
+  async checkRepositoryAccess(config: GetRepositoryConfig): Promise<RepositoryAccessResult | null> {
+    if (!this.appConfig) {
+      throw new SourceControlProviderError(
+        "GitHub App not configured - cannot check repository access",
+        "permanent"
+      );
+    }
+
+    try {
+      const repo = await getInstallationRepository(
+        this.appConfig,
+        config.owner,
+        config.name,
+        this.kvCache ? { REPOS_CACHE: this.kvCache } : undefined
+      );
+      if (!repo) {
+        return null;
+      }
+      return {
+        repoId: repo.id,
+        repoOwner: config.owner.toLowerCase(),
+        repoName: config.name.toLowerCase(),
+        defaultBranch: repo.defaultBranch,
+      };
+    } catch (error) {
+      throw SourceControlProviderError.fromFetchError(
+        `Failed to check repository access: ${error instanceof Error ? error.message : String(error)}`,
+        error,
+        extractHttpStatus(error)
+      );
+    }
+  }
+
+  /**
+   * List all repositories accessible to the GitHub App installation.
+   */
+  async listRepositories(): Promise<InstallationRepository[]> {
+    if (!this.appConfig) {
+      throw new SourceControlProviderError(
+        "GitHub App not configured - cannot list repositories",
+        "permanent"
+      );
+    }
+
+    try {
+      const result = await listInstallationRepositories(
+        this.appConfig,
+        this.kvCache ? { REPOS_CACHE: this.kvCache } : undefined
+      );
+      return result.repos;
+    } catch (error) {
+      throw SourceControlProviderError.fromFetchError(
+        `Failed to list repositories: ${error instanceof Error ? error.message : String(error)}`,
+        error,
+        extractHttpStatus(error)
+      );
+    }
+  }
+
+  /**
+   * List branches for a repository.
+   */
+  async listBranches(config: GetRepositoryConfig): Promise<{ name: string }[]> {
+    if (!this.appConfig) {
+      throw new SourceControlProviderError(
+        "GitHub App not configured - cannot list branches",
+        "permanent"
+      );
+    }
+
+    try {
+      return await listRepositoryBranches(
+        this.appConfig,
+        config.owner,
+        config.name,
+        this.kvCache ? { REPOS_CACHE: this.kvCache } : undefined
+      );
+    } catch (error) {
+      throw SourceControlProviderError.fromFetchError(
+        `Failed to list branches: ${error instanceof Error ? error.message : String(error)}`,
+        error,
+        extractHttpStatus(error)
+      );
+    }
+  }
+
+  /**
    * Generate authentication for git push operations using GitHub App.
    */
   async generatePushAuth(): Promise<GitPushAuthContext> {
@@ -194,7 +301,7 @@ export class GitHubSourceControlProvider implements SourceControlProvider {
     }
 
     try {
-      const token = await generateInstallationToken(this.appConfig);
+      const token = await getCachedInstallationToken(this.appConfig);
       return {
         authType: "app",
         token,

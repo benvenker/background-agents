@@ -2,6 +2,35 @@
  * Type definitions for Open-Inspect Control Plane.
  */
 
+import type {
+  ArtifactType,
+  EventType,
+  MessageSource,
+  MessageStatus,
+  ParticipantRole,
+  SessionStatus,
+} from "@open-inspect/shared";
+
+export type {
+  ArtifactType,
+  Attachment,
+  ClientMessage,
+  CreateSessionRequest,
+  CreateSessionResponse,
+  EventType,
+  GitSyncStatus,
+  MessageSource,
+  MessageStatus,
+  ParticipantRole,
+  ParticipantPresence,
+  SpawnSource,
+  SandboxEvent,
+  SandboxStatus,
+  ServerMessage,
+  SessionState,
+  SessionStatus,
+} from "@open-inspect/shared";
+
 // Environment bindings
 export interface Env {
   // Durable Objects
@@ -12,6 +41,10 @@ export interface Env {
 
   // Service bindings
   SLACK_BOT?: Fetcher; // Optional - only if slack-bot is deployed
+  LINEAR_BOT?: Fetcher; // Optional - only if linear-bot is deployed
+
+  // Durable Objects (optional)
+  SCHEDULER?: DurableObjectNamespace; // SchedulerDO for automation engine
 
   // D1 database
   DB: D1Database;
@@ -41,220 +74,10 @@ export interface Env {
 
   // Sandbox lifecycle configuration
   SANDBOX_INACTIVITY_TIMEOUT_MS?: string; // Inactivity timeout in ms (default: 600000 = 10 min)
+  EXECUTION_TIMEOUT_MS?: string; // Max processing time before auto-fail (default: 5400000 = 90 min)
 
   // Logging
   LOG_LEVEL?: string; // "debug" | "info" | "warn" | "error" (default: "info")
-}
-
-// Session status
-export type SessionStatus = "created" | "active" | "completed" | "archived";
-
-// Sandbox status
-export type SandboxStatus =
-  | "pending"
-  | "spawning"
-  | "connecting"
-  | "warming"
-  | "syncing"
-  | "ready"
-  | "running"
-  | "stale" // Heartbeat missed - sandbox may be unresponsive
-  | "snapshotting" // Taking filesystem snapshot
-  | "stopped"
-  | "failed";
-
-// Git sync status
-export type GitSyncStatus = "pending" | "in_progress" | "completed" | "failed";
-
-// Participant role
-export type ParticipantRole = "owner" | "member";
-
-// Message status
-export type MessageStatus = "pending" | "processing" | "completed" | "failed";
-
-// Message source
-export type MessageSource = "web" | "slack" | "extension" | "github";
-
-// Event types
-export type EventType = "tool_call" | "tool_result" | "token" | "error" | "git_sync";
-
-// Artifact types
-export type ArtifactType = "pr" | "screenshot" | "preview" | "branch";
-
-// Client → Server messages
-export type ClientMessage =
-  | { type: "ping" }
-  | { type: "subscribe"; token: string; clientId: string }
-  | {
-      type: "prompt";
-      content: string;
-      model?: string;
-      reasoningEffort?: string;
-      attachments?: Attachment[];
-    }
-  | { type: "stop" }
-  | { type: "typing" }
-  | {
-      type: "presence";
-      status: "active" | "idle";
-      cursor?: { line: number; file: string };
-    }
-  | { type: "fetch_history"; cursor: { timestamp: number; id: string }; limit?: number };
-
-// Server → Client messages
-export type ServerMessage =
-  | { type: "pong"; timestamp: number }
-  | {
-      type: "subscribed";
-      sessionId: string;
-      state: SessionState;
-      participantId: string;
-      participant?: { participantId: string; name: string; avatar?: string };
-    }
-  | { type: "prompt_queued"; messageId: string; position: number }
-  | { type: "sandbox_event"; event: SandboxEvent }
-  | { type: "presence_sync"; participants: ParticipantPresence[] }
-  | { type: "presence_update"; participants: ParticipantPresence[] }
-  | { type: "presence_leave"; userId: string }
-  | { type: "sandbox_warming" }
-  | { type: "sandbox_spawning" }
-  | { type: "sandbox_status"; status: string }
-  | { type: "sandbox_ready" }
-  | { type: "sandbox_error"; error: string }
-  | { type: "error"; code: string; message: string }
-  | {
-      type: "artifact_created";
-      artifact: { id: string; type: string; url: string; prNumber?: number };
-    }
-  | { type: "snapshot_saved"; imageId: string; reason: string }
-  | { type: "sandbox_restored"; message: string }
-  | { type: "sandbox_warning"; message: string }
-  | { type: "session_status"; status: SessionStatus }
-  | { type: "processing_status"; isProcessing: boolean }
-  | {
-      type: "replay_complete";
-      hasMore: boolean;
-      cursor: { timestamp: number; id: string } | null;
-    }
-  | {
-      type: "history_page";
-      items: SandboxEvent[];
-      hasMore: boolean;
-      cursor: { timestamp: number; id: string } | null;
-    };
-
-// Sandbox events (from Modal)
-export type SandboxEvent =
-  | { type: "heartbeat"; sandboxId: string; status: string; timestamp: number }
-  | {
-      type: "token";
-      content: string;
-      messageId: string;
-      sandboxId: string;
-      timestamp: number;
-    }
-  | {
-      type: "tool_call";
-      tool: string;
-      args: Record<string, unknown>;
-      callId: string;
-      messageId: string;
-      sandboxId: string;
-      timestamp: number;
-    }
-  | {
-      type: "tool_result";
-      callId: string;
-      result: string;
-      error?: string;
-      messageId: string;
-      sandboxId: string;
-      timestamp: number;
-    }
-  | {
-      type: "git_sync";
-      status: GitSyncStatus;
-      sha?: string;
-      sandboxId: string;
-      timestamp: number;
-    }
-  | {
-      type: "error";
-      error: string;
-      messageId: string;
-      sandboxId: string;
-      timestamp: number;
-    }
-  | {
-      type: "execution_complete";
-      messageId: string;
-      success: boolean;
-      error?: string;
-      sandboxId: string;
-      timestamp: number;
-    }
-  | {
-      type: "artifact";
-      artifactType: string;
-      url: string;
-      metadata?: Record<string, unknown>;
-      sandboxId: string;
-      timestamp: number;
-    }
-  | {
-      type: "push_complete";
-      branchName: string;
-      sandboxId?: string;
-      timestamp?: number;
-    }
-  | {
-      type: "push_error";
-      branchName: string;
-      error: string;
-      sandboxId?: string;
-      timestamp?: number;
-    }
-  | {
-      type: "user_message";
-      content: string;
-      messageId: string;
-      timestamp: number;
-      author?: { participantId: string; name: string; avatar?: string };
-    };
-
-// Attachment
-export interface Attachment {
-  type: "file" | "image" | "url";
-  name: string;
-  url?: string;
-  content?: string;
-  mimeType?: string;
-}
-
-// Session state (sent to client on subscribe)
-export interface SessionState {
-  id: string;
-  title: string | null;
-  repoOwner: string;
-  repoName: string;
-  branchName: string | null;
-  status: SessionStatus;
-  sandboxStatus: SandboxStatus;
-  messageCount: number;
-  createdAt: number;
-  model?: string;
-  reasoningEffort?: string;
-  isProcessing: boolean;
-}
-
-// Participant presence
-export interface ParticipantPresence {
-  participantId: string;
-  userId: string;
-  name: string;
-  avatar?: string;
-  status: "active" | "idle" | "away";
-  lastSeen: number;
 }
 
 // Client info (stored in DO memory)
@@ -270,26 +93,12 @@ export interface ClientInfo {
   lastFetchHistoryAt?: number;
 }
 
-// API response types
-export interface CreateSessionRequest {
-  repoOwner: string;
-  repoName: string;
-  title?: string;
-  model?: string; // LLM model to use (e.g., "anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-4-5")
-  reasoningEffort?: string; // Reasoning effort level (e.g., "high", "max")
-}
-
-export interface CreateSessionResponse {
-  sessionId: string;
-  status: SessionStatus;
-}
-
 export interface SessionResponse {
   id: string;
   title: string | null;
   repoOwner: string;
   repoName: string;
-  repoDefaultBranch: string;
+  baseBranch: string;
   branchName: string | null;
   baseSha: string | null;
   currentSha: string | null;
@@ -341,8 +150,8 @@ export interface ArtifactResponse {
 export interface ParticipantResponse {
   id: string;
   userId: string;
-  githubLogin: string | null;
-  githubName: string | null;
+  scmLogin: string | null;
+  scmName: string | null;
   role: ParticipantRole;
   joinedAt: number;
 }

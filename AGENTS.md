@@ -1,174 +1,159 @@
 # AGENTS.md
 
-Instructions for Codex agents working in this repository.
+Open-Inspect is a background coding agent system that spawns sandboxed dev environments to work on
+GitHub repositories. Single-tenant design. Stack: Cloudflare Workers (TypeScript), Modal (Python),
+Next.js (React), Terraform.
 
-## Scope
+## Architecture
 
-- This file applies to the full repository rooted at
-  `/Users/ben/code/poolside/agentic/background-agents`.
-- Follow direct user instructions first, then this file.
+Three tiers connected by WebSockets:
 
-## Session Startup
+1. **Web Client** (Next.js on Vercel or Cloudflare Workers via OpenNext) — UI with GitHub OAuth,
+   session dashboard, real-time streaming
+2. **Control Plane** (Cloudflare Workers + Durable Objects) — session lifecycle, WebSocket hub,
+   GitHub/auth integration. Each session is a Durable Object with SQLite storage. Uses D1 for
+   session index, repo metadata, and encrypted repo secrets.
+3. **Data Plane** (Modal, Python) — sandboxed environments running coding agents. Manages sandbox
+   creation, warm pools, snapshots.
 
-1. Run memory context first:
-   - `cm context "<task/question>" --json`
-2. If prior decisions may matter, search prior sessions:
-   - `cass search "<query>" --limit 5`
-   - Use `--json` when output will be parsed.
-3. If `cm` or `cass` are unavailable, continue and note the limitation briefly.
+**Bot integrations** — all Cloudflare Workers using Hono:
 
-## Tooling Priority
+- `slack-bot` — Slack messages → coding sessions
+- `github-bot` — PR review assignments and @mention commands
+- `linear-bot` — Linear agent webhooks → coding sessions
 
-- Prefer MCP tools when available.
-- CLI fallback order:
-  - `rg` / `rg --files` for search and file discovery
-  - repository scripts in `scripts/`
-  - package manager scripts from `package.json`
-- Avoid broad or slow scans when targeted `rg` queries are sufficient.
+**Data flow**: User prompt → web client → control plane DO (WebSocket) → Modal sandbox → streaming
+events back through the same WebSocket chain.
 
-## Beads Rust (`br`) Workflow
+### Package Dependency Graph
 
-`br` is the source of truth for issue lifecycle in this repo.
-
-Policy:
-
-- Use `br` for create/update/close/deps/sync operations.
-- Use `bv` for graph-aware triage and planning.
-- Do not use `bd` in this repository.
-
-Essential commands:
-
-```bash
-br ready --json
-br list --status open
-br show <id>
-br create --title "..." --type task --priority 2 --description "..."
-br update <id> --status in_progress
-br close <id> --reason "Completed"
-br sync --flush-only
+```
+@open-inspect/shared  ←  control-plane, web, slack-bot, github-bot, linear-bot
 ```
 
-Workflow pattern:
+**Build `@open-inspect/shared` first** whenever you change shared types. Other packages import from
+it at build time.
 
-1. Start: `br ready --json` (or `bv --robot-next --format toon`).
-2. Claim: `br update <id> --status in_progress --assignee <agent-name>`.
-3. Work: implement only scoped task changes.
-4. Complete: `br close <id> --reason "Completed"`.
-5. Sync: `br sync --flush-only` before final commit/push.
+## Package Overview
 
-Committing `.beads/` changes:
+| Package         | Lang / Framework                   | Purpose                                                     |
+| --------------- | ---------------------------------- | ----------------------------------------------------------- |
+| `shared`        | TypeScript                         | Shared types, auth utilities, model definitions             |
+| `control-plane` | TypeScript / CF Workers + DO       | Session management, WebSocket streaming, GitHub integration |
+| `web`           | TypeScript / Next.js 16 + React 19 | User-facing dashboard, OAuth, real-time UI                  |
+| `slack-bot`     | TypeScript / CF Workers + Hono     | Slack event handler, session creation                       |
+| `github-bot`    | TypeScript / CF Workers + Hono     | PR review and @mention webhook handler                      |
+| `linear-bot`    | TypeScript / CF Workers + Hono     | Linear agent webhook handler                                |
+| `modal-infra`   | Python 3.12 / Modal + FastAPI      | Sandbox lifecycle, WebSocket bridge to control plane        |
 
-- Commit: `.beads/config.yaml`, `.beads/metadata.json`, `.beads/issues.jsonl`,
-  `.beads/interactions.jsonl`, `.beads/.gitignore`.
-- Do not commit: SQLite runtime files (`*.db`, `*.db-wal`, `*.db-shm`), lock files, `last-touched`.
-
-## Beads Viewer (`bv`) Sidecar
-
-`bv` is for dependency-aware analysis, not lifecycle mutation.
-
-Rules:
-
-- Use only `--robot-*` commands in automation.
-- Never run bare `bv` from agents because it opens an interactive TUI.
-- Start triage with `bv --robot-triage --format toon` or `bv --robot-next --format toon`.
-
-Common robot commands:
+## Common Commands
 
 ```bash
-bv --robot-next --format toon
-bv --robot-triage --format toon
-bv --robot-plan --format toon
-bv --robot-insights --format toon
+# Install & build
+npm install
+npm run build                                    # all packages
+npm run build -w @open-inspect/shared            # shared only (build first!)
+
+# Lint & format
+npm run lint:fix                                 # ESLint + Prettier fix
+npm run format                                   # Prettier only
+npm run typecheck                                # tsc across all TS packages
+
+# Tests — TypeScript (Vitest)
+npm test -w @open-inspect/control-plane          # unit tests (node env)
+npm run test:integration -w @open-inspect/control-plane  # integration (workerd/Miniflare + real D1)
+npm test -w @open-inspect/web
+npm test -w @open-inspect/github-bot
+npm test -w @open-inspect/slack-bot
+npm test -w @open-inspect/linear-bot
+
+# Tests — Python (pytest)
+cd packages/modal-infra && pytest tests/ -v
+
+# Python linting
+cd packages/modal-infra && ruff check --fix && ruff format
 ```
 
-Fallback if `bv` is unavailable:
+## Testing
 
-- `br ready --json`
-- `br show <id>`
+All TypeScript packages use **Vitest**; Python uses **pytest** + pytest-asyncio.
 
-## MCP Agent Mail Workflow
+### Test file locations
 
-Use MCP Agent Mail for agent coordination (claim broadcasts, file reservations, completion notices).
+- **control-plane unit**: co-located as `src/**/*.test.ts` — run in Node environment
+- **control-plane integration**: separate `test/integration/*.test.ts` — run in workerd via
+  `@cloudflare/vitest-pool-workers` with real D1 bindings
+- **web, slack-bot, linear-bot**: co-located `src/**/*.test.ts`
+- **github-bot**: separate `test/*.test.ts`
+- **modal-infra**: `tests/test_*.py`
 
-Operational protocol:
+### Control-plane integration tests
 
-1. Register fixed identity for this repo:
-   - `ensure_project(project_key="/Users/ben/code/poolside/agentic/background-agents")`
-   - `register_agent(..., name="<fixed agent name>")`
-2. Claim bead in `br` before edits:
-   - `br update <bead-id> --status in_progress --assignee <agent-name>`
-3. Reserve files before editing:
-   - `file_reservation_paths(project_key, agent_name, paths=[...], exclusive=true, ttl_seconds=3600, reason="<bead-id>: ...")`
-4. Send start update with `send_message` once recipients are known.
-5. On completion:
-   - `release_file_reservations(...)`
-   - `br close <bead-id> --reason "Completed"`
-   - completion message to interested agents
-   - `br sync --flush-only`
+These run inside a real `workerd` runtime with Miniflare, using `defineWorkersConfig`. Important:
 
-Guardrails:
+- `isolatedStorage: false` due to a workers-sdk SQLite WAL cleanup bug — tests share storage
+- Use `cleanD1Tables()` or equivalent cleanup in `beforeEach` to avoid cross-test pollution
+- D1 migrations from `terraform/d1/migrations/` are applied automatically via
+  `test/integration/apply-migrations.ts`
+- Helpers in `test/integration/helpers.ts`: `initSession()`, `queryDO()`, `seedEvents()`
 
-- Do not use `create_agent_identity` unless explicitly requested.
-- If reservation conflicts occur, narrow path scope or pick another ready bead.
+## Coding Conventions
 
-## Swarm Launcher
+### Durations and timeouts
 
-Use the shared swarm launcher script:
+- **Use seconds for Python, milliseconds for TypeScript.** These match each ecosystem's conventions
+  (Modal `timeout=` takes seconds; control-plane uses `_MS` suffixes throughout).
+- **Encode the unit in the name.** Python: `timeout_seconds`. TypeScript: `timeoutMs`,
+  `INACTIVITY_TIMEOUT_MS`. Never use a bare `timeout`.
+- **Define each default value exactly once.** Extract to a named constant and import everywhere.
+- **Don't restate literal values in comments.** Write `Defaults to DEFAULT_SANDBOX_TIMEOUT_SECONDS`,
+  not `Default: 7200`.
 
-- `/Users/ben/code/poolside/console-cli/scripts/beads-swarm`
+### Extending existing patterns
 
-Recommended invocation for this repo:
+- When threading an existing field through new code paths, evaluate whether the existing design
+  (naming, types, units) is correct — don't blindly propagate it. Fix bad names or units in the same
+  change rather than spreading the problem.
 
-```bash
-/Users/ben/code/poolside/console-cli/scripts/beads-swarm background-agents \
-  --claude 0 --codex 4 --gemini 0 \
-  --names "RedStone,GreenCastle,PurpleBear,BlueLake"
-```
+### Commit messages
 
-Useful options:
+Use conventional commits: `feat:`, `fix:`, `docs:`, `refactor:`, `chore:`, `test:`. Keep the subject
+under 72 characters. Use the PR body for details, not the commit message.
 
-- `--stagger <seconds>`: delay first-claim attempts to reduce collisions.
-- `--launch-delay <seconds>`: delay between pane launches.
-- `--template <path>`: custom Agent Mail bootstrap template.
-- `--attach` / `--detach`: attach behavior after launch.
+## Key Gotchas
 
-Notes:
+- **Build order**: always build `@open-inspect/shared` before packages that depend on it.
+- **PKCS#8 keys**: Cloudflare Workers require PKCS#8 format for GitHub App private keys — convert
+  with `openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt`.
+- **Durable Object bindings**: new DO bindings require a two-phase Terraform deploy — first with
+  `enable_durable_object_bindings = false`, then `true`.
+- **No `wrangler.toml`**: control-plane config is generated by Terraform, not checked in.
+- **Modal deployment**: never deploy `src/app.py` directly — use `modal deploy deploy.py` or
+  `modal deploy -m src`. The `app.py` file doesn't import function modules.
+- **Modal image rebuild**: update `CACHE_BUSTER` in `src/images/base.py` to force a rebuild.
+- **Web platform choice**: set `web_platform = "cloudflare"` in Terraform variables to deploy the
+  web app to Cloudflare Workers via OpenNext instead of Vercel. When using Cloudflare, Vercel
+  credentials are not required (dummy defaults are used). `NEXT_PUBLIC_WS_URL` must be available at
+  build time since Next.js inlines `NEXT_PUBLIC_*` vars into the client bundle.
 
-- Keep session name `background-agents` unless intentionally using a separate project/session.
-- Generated per-agent prompts are written under `/tmp/beads-swarm-prompts/<session>/`.
+## CI/CD
 
-## Repo-Aware Guardrails
+Pushing to `main` auto-deploys changed services:
 
-- Read `README.md` and `CLAUDE.md` for architecture/deployment details before infra changes.
-- For Terraform work, use environment-specific files under:
-  - `terraform/environments/production/`
-- Do not deploy Modal by targeting `src/app.py` directly; use the documented deploy entrypoints.
-- Keep changes minimal and scoped to the user request.
+- **Terraform** → control plane + D1 migrations + web app if `web_platform = "cloudflare"`
+  (triggers: `terraform/`, `packages/*/`)
+- **Vercel** → web app when `web_platform = "vercel"` (triggers: `packages/web/`,
+  `packages/shared/`)
+- **Modal** → data plane (triggers: `packages/modal-infra/`, deployed via Terraform apply)
 
-## Editing Rules
+CI runs lint, typecheck, and tests for all TypeScript and Python packages on every push and PR.
 
-- Preserve existing style and naming conventions.
-- Do not refactor unrelated code.
-- Do not revert user-authored or unrelated working tree changes.
-- Add comments only when they clarify non-obvious logic.
+## Further Reading
 
-## Validation
-
-- Run the smallest relevant checks for touched code.
-- If full validation is too expensive, run targeted checks and state what was not run.
-- Prefer reproducible commands and include exact command strings in summaries.
-
-## Response Expectations
-
-- Be concise and action-oriented.
-- Report:
-  - what changed,
-  - where it changed,
-  - what validation was run,
-  - any follow-up risk or next step.
-
-## Memory Wrap-Up
-
-Before final response, store a useful workflow memory:
-
-- `cm add "<decision/result/user preference>" --category workflow --json`
+- [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) — deploy your own instance
+- [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) — detailed architecture and session lifecycle
+- [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guidelines
+- [packages/control-plane/README.md](packages/control-plane/README.md) — API reference, WebSocket
+  protocol, D1 schema, security model
+- [packages/modal-infra/README.md](packages/modal-infra/README.md) — sandbox internals, Modal
+  deployment, endpoint URLs

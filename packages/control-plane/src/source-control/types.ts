@@ -4,6 +4,8 @@
  * Core interfaces and type definitions for source control platform abstraction.
  */
 
+import type { InstallationRepository } from "@open-inspect/shared";
+
 /**
  * Repository information.
  */
@@ -109,6 +111,20 @@ export interface GetRepositoryConfig {
   owner: string;
   /** Repository name */
   name: string;
+}
+
+/**
+ * Result of checking repository access via app-level credentials.
+ */
+export interface RepositoryAccessResult {
+  /** Provider-specific numeric repository ID */
+  repoId: number;
+  /** Normalized (lowercase) repository owner */
+  repoOwner: string;
+  /** Normalized (lowercase) repository name */
+  repoName: string;
+  /** Repository's default branch (e.g., "main") */
+  defaultBranch: string;
 }
 
 /**
@@ -227,6 +243,33 @@ export interface SourceControlProvider {
   // These methods use app-level credentials (e.g., GitHub App installation token)
   // configured at provider construction time, not user tokens.
   //
+
+  /**
+   * Check whether a specific repository is accessible to this deployment's
+   * app-level credentials (e.g. GitHub App installation).
+   *
+   * @param config - Repository identifier (owner/name)
+   * @returns Access result with normalized identifiers, or null if not accessible
+   * @throws SourceControlProviderError on configuration errors
+   */
+  checkRepositoryAccess(config: GetRepositoryConfig): Promise<RepositoryAccessResult | null>;
+
+  /**
+   * List all repositories accessible to this deployment's app-level credentials.
+   *
+   * @returns Array of installation repositories
+   * @throws SourceControlProviderError on configuration or API errors
+   */
+  listRepositories(): Promise<InstallationRepository[]>;
+
+  /**
+   * List branches for a repository.
+   *
+   * @param config - Repository identifier (owner/name)
+   * @returns Array of branch names
+   * @throws SourceControlProviderError on configuration or API errors
+   */
+  listBranches(config: GetRepositoryConfig): Promise<{ name: string }[]>;
 
   /**
    * Generate authentication for git push operations.
