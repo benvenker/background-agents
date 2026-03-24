@@ -23,6 +23,14 @@ export const VALID_MODELS = [
   "opencode/kimi-k2.5",
   "opencode/minimax-m2.5",
   "opencode/glm-5",
+  "openrouter/openai/gpt-5.4",
+  "openrouter/openai/gpt-5.3-codex",
+  "openrouter/anthropic/claude-opus-4-6",
+  "openrouter/anthropic/claude-opus-4-5",
+  "openrouter/anthropic/claude-sonnet-4-6",
+  "openrouter/anthropic/claude-haiku-4-5",
+  "openrouter/google/gemini-3.1-pro",
+  "openrouter/google/gemini-3.1-flash",
 ] as const;
 
 export type ValidModel = (typeof VALID_MODELS)[number];
@@ -61,6 +69,12 @@ export const MODEL_REASONING_CONFIG: Partial<Record<ValidModel, ModelReasoningCo
   "openai/gpt-5.2-codex": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
   "openai/gpt-5.3-codex": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
   "openai/gpt-5.3-codex-spark": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
+  "openrouter/openai/gpt-5.4": { efforts: ["none", "low", "medium", "high", "xhigh"], default: undefined },
+  "openrouter/openai/gpt-5.3-codex": { efforts: ["low", "medium", "high", "xhigh"], default: "high" },
+  "openrouter/anthropic/claude-opus-4-6": { efforts: ["low", "medium", "high", "max"], default: "high" },
+  "openrouter/anthropic/claude-opus-4-5": { efforts: ["high", "max"], default: "max" },
+  "openrouter/anthropic/claude-sonnet-4-6": { efforts: ["low", "medium", "high", "max"], default: "high" },
+  "openrouter/anthropic/claude-haiku-4-5": { efforts: ["high", "max"], default: "max" },
 };
 
 export interface ModelDisplayInfo {
@@ -119,6 +133,51 @@ export const MODEL_OPTIONS: ModelCategory[] = [
         id: "openai/gpt-5.3-codex-spark",
         name: "GPT 5.3 Codex Spark",
         description: "Low-latency codex variant",
+      },
+    ],
+  },
+  {
+    category: "OpenRouter",
+    models: [
+      {
+        id: "openrouter/openai/gpt-5.4",
+        name: "GPT 5.4",
+        description: "OpenAI flagship via OpenRouter",
+      },
+      {
+        id: "openrouter/openai/gpt-5.3-codex",
+        name: "GPT 5.3 Codex",
+        description: "OpenAI codex via OpenRouter",
+      },
+      {
+        id: "openrouter/anthropic/claude-opus-4-6",
+        name: "Claude Opus 4.6",
+        description: "Anthropic flagship via OpenRouter",
+      },
+      {
+        id: "openrouter/anthropic/claude-opus-4-5",
+        name: "Claude Opus 4.5",
+        description: "Anthropic via OpenRouter",
+      },
+      {
+        id: "openrouter/anthropic/claude-sonnet-4-6",
+        name: "Claude Sonnet 4.6",
+        description: "Fast coding via OpenRouter",
+      },
+      {
+        id: "openrouter/anthropic/claude-haiku-4-5",
+        name: "Claude Haiku 4.5",
+        description: "Fast and efficient via OpenRouter",
+      },
+      {
+        id: "openrouter/google/gemini-3.1-pro",
+        name: "Gemini 3.1 Pro",
+        description: "Google flagship via OpenRouter",
+      },
+      {
+        id: "openrouter/google/gemini-3.1-flash",
+        name: "Gemini 3.1 Flash",
+        description: "Google fast via OpenRouter",
       },
     ],
   },
